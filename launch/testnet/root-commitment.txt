@@ -1,0 +1,4 @@
+Monario public testnet v1
+Anchor height: 0
+Accounts and notes: empty
+Initial issuance: 0 atoms

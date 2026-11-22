@@ -1,0 +1,74 @@
+name: macOS testnet wallet
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    name: macOS ${{ matrix.arch }} testnet wallet
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            arch: x86_64
+          - runner: macos-15
+            arch: arm64
+    env:
+      RUSTUP_TOOLCHAIN: '1.96.1'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Fetch locked dependencies and qualify the native package
+        shell: bash
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(uname -m)" = "$EXPECTED_ARCH"
+          stage=$(mktemp -d "$RUNNER_TEMP/monario.XXXXXXXX")
+          stage=$(cd "$stage" && pwd -P)
+          mkdir "$stage/source"
+          tar -cf - Cargo.toml Cargo.lock crates src tests vendor launch/testnet \
+            docs/desktop-release.md website/assets/monario-mark.png \
+            tools/build_private.py tools/package_desktop.py tools/package_macos.sh \
+            tools/verify_vendor.py | tar -xf - -C "$stage/source"
+
+          export CARGO_HOME="$stage/cargo"
+          export CARGO_TARGET_DIR="$stage/target"
+          export MONARIO_PRIVATE_SCAN_FILE="$stage/private-terms"
+          printf '%s\n' "$GITHUB_WORKSPACE" "$RUNNER_TEMP" "$stage" > "$MONARIO_PRIVATE_SCAN_FILE"
+
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          cd "$stage/source"
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          cargo fetch --locked --target "$host"
+          CARGO_NET_OFFLINE=true sh tools/package_macos.sh
+
+          archive="monario-testnet-desktop-macos-$EXPECTED_ARCH.zip"
+          artifacts="$RUNNER_TEMP/monario-artifacts"
+          mkdir "$artifacts"
+          cp "$CARGO_TARGET_DIR/$archive" "$artifacts/$archive"
+          cd "$artifacts"
+          shasum -a 256 "$archive" > SHA256SUMS
+          shasum -a 256 -c SHA256SUMS
+
+      - name: Upload verified preview and checksum
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: monario-testnet-macos-${{ matrix.arch }}
+          path: ${{ runner.temp }}/monario-artifacts/
+          if-no-files-found: error
+          retention-days: 14

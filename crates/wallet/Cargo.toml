@@ -1,0 +1,32 @@
+[package]
+name = "monario-wallet"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+description = "Monario versioned deterministic wallet key and address derivation"
+
+[dependencies]
+monario-address = { path = "../address" }
+orchard = { version = "=0.16.0", default-features = false, features = ["std", "zeroize"] }
+zip32 = { version = "=0.3.0", features = ["zeroize"] }
+zeroize = "=1.9.1"
+hmac = { version = "=0.13.0", features = ["zeroize"] }
+sha2 = { version = "=0.11.1", features = ["zeroize"] }
+ripemd = "=0.2.0"
+secp256k1 = "=0.33.1"
+getrandom = "=0.4.3"
+argon2 = { version = "=0.6.0", default-features = false, features = ["alloc", "zeroize"] }
+chacha20poly1305 = { version = "=0.11.0", default-features = false, features = ["zeroize"] }
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
+
+[dev-dependencies]
+bip32 = { version = "=0.6.0", default-features = false, features = ["secp256k1-ffi", "alloc"] }
+tempfile = "=3.27.0"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+
+[lints.clippy]
+all = "deny"

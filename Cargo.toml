@@ -1,0 +1,32 @@
+[package]
+name = "monario-monetary"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+description = "Monario monetary consensus primitives (MONAR)"
+
+[lib]
+path = "src/lib.rs"
+
+[workspace]
+members = ["crates/pow", "crates/randomx", "crates/chain", "crates/v6", "crates/address", "crates/wallet", "crates/wallet-scan", "crates/node", "crates/wallet-cli", "crates/wallet-gui"]
+default-members = [".", "crates/pow", "crates/randomx", "crates/chain", "crates/v6", "crates/address", "crates/wallet", "crates/wallet-scan", "crates/node", "crates/wallet-cli", "crates/wallet-gui"]
+resolver = "3"
+exclude = ["vendor/librustzcash"]
+
+[patch.crates-io]
+zcash_primitives = { path = "vendor/monario-zcash-primitives" }
+zcash_protocol = { path = "vendor/librustzcash/components/zcash_protocol" }
+clipboard-win = { path = "vendor/clipboard-win" }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+
+[lints.clippy]
+all = "deny"
+
+[profile.release]
+overflow-checks = true
+

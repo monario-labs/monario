@@ -1,0 +1,40 @@
+[package]
+name = "monario-wallet-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+
+[[bin]]
+name = "monario-wallet"
+path = "src/main.rs"
+
+[dependencies]
+monario-wallet = { path = "../wallet" }
+monario-address = { path = "../address" }
+monario-wallet-scan = { path = "../wallet-scan" }
+monario-chain = { path = "../chain" }
+monario-v6 = { path = "../v6" }
+monario-monetary = { path = "../.." }
+monario-node = { path = "../node" }
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+zeroize = "=1.9.1"
+subtle = "=2.6.1"
+secp256k1 = "=0.33.1"
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+orchard = { version = "=0.16.0", default-features = false, features = ["std"] }
+incrementalmerkletree = { version = "=0.9.0", features = ["legacy-api"] }
+zcash_primitives = { version = "=0.31.0", default-features = false, features = ["std"] }
+zcash_protocol = "=0.11.0"
+zcash_transparent = "=0.11.0"
+zcash_script = "=0.6.0"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"

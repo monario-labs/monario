@@ -1,0 +1,20 @@
+[package]
+name = "monario-address"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+description = "Monario network-bound transparent and Ironwood payment addresses"
+
+[dependencies]
+bech32 = "=0.11.1"
+orchard = { version = "=0.16.0", default-features = false, features = ["std"] }
+zcash_transparent = "=0.11.0"
+zcash_script = "=0.6.0"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+
+[lints.clippy]
+all = "deny"

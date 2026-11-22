@@ -1,0 +1,29 @@
+[package]
+name = "monario-wallet-gui"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+
+[[bin]]
+name = "monario-wallet-gui"
+path = "src/main.rs"
+
+[lib]
+name = "monario_wallet_gui"
+path = "src/lib.rs"
+
+[dependencies]
+eframe = { version = "=0.31.1", default-features = false, features = ["default_fonts", "glow"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+zeroize = "=1.9.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "=0.31.1", default-features = false, features = ["x11", "wayland"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"

@@ -1,0 +1,27 @@
+[package]
+name = "monario-v6"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+
+[dependencies]
+monario-chain = { path = "../chain" }
+monario-monetary = { path = "../.." }
+zcash_primitives = { version = "=0.31.0", default-features = false, features = ["std"] }
+zcash_protocol = "=0.11.0"
+zcash_transparent = "=0.11.0"
+zcash_script = "=0.6.0"
+orchard = { version = "=0.16.0", default-features = false, features = ["circuit", "std"] }
+incrementalmerkletree = "=0.9.0"
+blake2b_simd = "=1.0.4"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dev-dependencies]
+monario-address = { path = "../address" }
+monario-wallet = { path = "../wallet" }
+secp256k1 = "=0.33.1"
+rand = { version = "=0.10.3", features = ["std_rng"] }
+tempfile = "=3.27.0"

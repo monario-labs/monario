@@ -1,0 +1,35 @@
+[package]
+name = "monario-wallet-scan"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+description = "Offline wallet scanning of Monario's validated durable chain"
+
+[dependencies]
+monario-wallet = { path = "../wallet" }
+monario-chain = { path = "../chain" }
+monario-v6 = { path = "../v6" }
+monario-monetary = { path = "../.." }
+orchard = { version = "=0.16.0", default-features = false, features = ["circuit", "std", "zeroize"] }
+incrementalmerkletree = { version = "=0.9.0", features = ["legacy-api"] }
+zcash_primitives = { version = "=0.31.0", default-features = false, features = ["std"] }
+zcash_protocol = "=0.11.0"
+zeroize = "=1.9.1"
+sha2 = { version = "=0.10.9", default-features = false }
+monario-address = { path = "../address" }
+zcash_transparent = "=0.11.0"
+zcash_script = "=0.6.0"
+secp256k1 = "=0.33.1"
+rand = { version = "=0.10.3", default-features = false, features = ["std", "std_rng"] }
+getrandom = "=0.4.3"
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"
