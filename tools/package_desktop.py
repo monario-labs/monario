@@ -14,36 +14,45 @@ import tempfile
 import zipfile
 
 
-def verify_macos(bundle, bin_dir, arch):
-    """Check the exact archived Mach-O files and run configuration checks only."""
+def verify_package(read, bin_dir, platform):
+    """Run offline checks against the exact archived binaries and configuration."""
     def run(args, cwd):
         result = subprocess.run(args, cwd=cwd, capture_output=True, check=False, timeout=30)
         if result.returncode != 0:
-            raise SystemExit("macOS package smoke check failed")
+            raise SystemExit("Desktop package smoke check failed")
         return result.stdout
 
     with tempfile.TemporaryDirectory(prefix="monario-check-") as directory:
         root = Path(directory)
         tools = []
-        for name in ("monario-wallet-gui", "monario-wallet", "monario-node", "monario-launch"):
+        suffix = ".exe" if platform.startswith("windows") else ""
+        for tool in ("monario-wallet-gui", "monario-wallet", "monario-node", "monario-launch"):
+            name = tool + suffix
             path = root / name
-            path.write_bytes(bundle.read(bin_dir + name))
+            path.write_bytes(read(bin_dir + name))
             path.chmod(0o755)
-            if run(["/usr/bin/lipo", "-archs", path], root).strip() != arch.encode("ascii"):
-                raise SystemExit(f"Unexpected Mach-O architecture for {name}")
+            if platform.startswith("macos"):
+                arch = platform.removeprefix("macos-")
+                if run(["/usr/bin/lipo", "-archs", path], root).strip() != arch.encode("ascii"):
+                    raise SystemExit(f"Unexpected Mach-O architecture for {name}")
             tools.append(path)
         _, wallet, node, launch = tools
-        for name in ("root.json", "node.json", "root-commitment.txt"):
-            (root / name).write_bytes(bundle.read(f"testnet/{name}"))
+        for name in ("root.json", "node.json", "root-commitment.txt", "bootstrap.json"):
+            (root / name).write_bytes(read(f"testnet/{name}"))
         root_check = json.loads(run([launch, "root-check", "root.json", "node.json"], root))
         manifest_check = json.loads(run([launch, "check", "node.json", "--strict"], root))
+        bootstrap = json.loads(run([launch, "bootstrap-check", "testnet", "--bundled", "node.json"], root))
+        archived = json.loads(run([launch, "bootstrap-check", "testnet", "bootstrap.json", "node.json"], root))
         commitment = sha256((root / "root-commitment.txt").read_bytes()).hexdigest()
         if (root_check.get("manifest_checked") is not True
                 or root_check.get("root_commitment") != commitment
                 or root_check.get("manifest_profile") != manifest_check.get("profile")
+                or bootstrap.get("profile") != manifest_check.get("profile")
+                or archived != bootstrap
                 or root_check.get("network_started") is not False
-                or manifest_check.get("network_started") is not False):
-            raise SystemExit("macOS package testnet configuration failed verification")
+                or manifest_check.get("network_started") is not False
+                or bootstrap.get("network_started") is not False):
+            raise SystemExit("Desktop package testnet configuration failed verification")
         run([wallet, "--version"], root)
         run([node, "--version"], root)
 
@@ -83,8 +92,12 @@ def main():
                     CFBundleVersion="1", CFBundleShortVersionString="0.1.0",
                     NSHighResolutionCapable=True)
         files["Monario Wallet.app/Contents/Info.plist"] = (plistlib.dumps(info), 0o644)
-    for name in ("README.md", "node.json", "root.json", "root-commitment.txt"):
+    for name in ("README.md", "node.json", "root.json", "root-commitment.txt", "peers.json"):
         files[f"testnet/{name}"] = ((root / "launch/testnet" / name).read_bytes(), 0o644)
+    descriptor = (root / "launch/bootstrap/testnet.json").read_bytes()
+    if json.loads(descriptor)["fallback"] != json.loads(files["testnet/peers.json"][0]):
+        raise SystemExit("Published peer envelope differs from the bundled testnet fallback")
+    files["testnet/bootstrap.json"] = (descriptor, 0o644)
     files["README.md"] = ((root / "docs/desktop-release.md").read_bytes(), 0o644)
     checksums = "".join(f"{sha256(data).hexdigest()}  {name}\n" for name, (data, _) in sorted(files.items()))
     files["SHA256SUMS"] = (checksums.encode("ascii"), 0o644)
@@ -104,8 +117,7 @@ def main():
         with zipfile.ZipFile(pending) as output:
             if output.namelist() != paths or any(output.read(path) != files[path][0] for path in paths):
                 raise SystemExit("Desktop archive verification failed")
-            if mac:
-                verify_macos(output, bin_dir, "arm64" if host.startswith("aarch64") else "x86_64")
+            verify_package(output.read, bin_dir, platform)
     else:
         with pending.open("wb") as raw, gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed:
             with tarfile.open(fileobj=compressed, mode="w", format=tarfile.USTAR_FORMAT) as output:
@@ -117,6 +129,7 @@ def main():
         with tarfile.open(pending) as output:
             if output.getnames() != paths or any(output.extractfile(path).read() != files[path][0] for path in paths):
                 raise SystemExit("Desktop archive verification failed")
+            verify_package(lambda path: output.extractfile(path).read(), bin_dir, platform)
     pending.replace(archive)
     print(f"{sha256(archive.read_bytes()).hexdigest()}  {archive.name}")
 

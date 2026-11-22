@@ -24,6 +24,13 @@ enum Network {
 }
 
 impl Network {
+    fn embedded(self) -> &'static [u8] {
+        match self {
+            Self::Mainnet => include_bytes!("../../../../launch/bootstrap/mainnet.json"),
+            Self::Testnet => include_bytes!("../../../../launch/bootstrap/testnet.json"),
+        }
+    }
+
     fn url(self) -> &'static str {
         match self {
             Self::Mainnet => "https://node.monario.org/mainnet/peers.json",
@@ -183,7 +190,7 @@ fn bundle(
 pub(super) fn check(
     network: &str,
     profile: [u8; 32],
-    bytes: &[u8],
+    bytes: Option<&[u8]>,
     now: u64,
 ) -> Result<serde_json::Value, Error> {
     let kind = match network {
@@ -191,7 +198,8 @@ pub(super) fn check(
         "testnet" => Network::Testnet,
         _ => return Err(Error::Arguments),
     };
-    let (_, fallback) = bundle(bytes, kind, profile)?.ok_or(Error::Configuration)?;
+    let (_, fallback) = bundle(bytes.unwrap_or_else(|| kind.embedded()), kind, profile)?
+        .ok_or(Error::Configuration)?;
     if fallback.expires <= now {
         return Err(Error::Configuration);
     }
@@ -298,16 +306,8 @@ fn select(
 /// Called only after explicit network activation and the authenticated receipt.
 /// No matching launch profile means no outbound bootstrap request.
 pub(super) fn startup(root: &Path, profile: [u8; 32]) -> Result<Vec<PeerTarget>, Error> {
-    let mainnet = bundle(
-        include_bytes!("../../../../launch/bootstrap/mainnet.json"),
-        Network::Mainnet,
-        profile,
-    )?;
-    let testnet = bundle(
-        include_bytes!("../../../../launch/bootstrap/testnet.json"),
-        Network::Testnet,
-        profile,
-    )?;
+    let mainnet = bundle(Network::Mainnet.embedded(), Network::Mainnet, profile)?;
+    let testnet = bundle(Network::Testnet.embedded(), Network::Testnet, profile)?;
     let (trust, fallback) = match (mainnet, testnet) {
         (Some(valid), None) | (None, Some(valid)) => valid,
         (None, None) => return Ok(Vec::new()),

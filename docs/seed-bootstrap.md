@@ -5,9 +5,10 @@
 | Mainnet | `https://node.monario.org/mainnet/peers.json` | `launch/bootstrap/mainnet.json` |
 | Testnet | `https://testnet.monario.org/testnet/peers.json` | `launch/bootstrap/testnet.json` |
 
-`null` means the network has no release bootstrap configuration. Both files
-ship disabled until real seed operators, signer keys, and network manifests
-are available. A release with a configured descriptor fetches once on each
+`null` means the network has no release bootstrap configuration. Mainnet
+remains disabled. Testnet embeds the signed fallback for the launch profile
+documented in [the testnet bundle](../launch/testnet/README.md).
+A release with a configured descriptor fetches once on each
 explicitly network-enabled start for that exact validation profile. Offline
 commands, pre-stopped startup, and unrecognized or regtest profiles skip the
 fetch. The destination is compiled into the node. HTTPS verifies certificates
@@ -47,6 +48,7 @@ The usual encrypted P2P handshake and full consensus validation still apply.
 
    ```sh
    monario-launch bootstrap-check testnet launch/bootstrap/testnet.json node.json
+   monario-launch bootstrap-check testnet --bundled node.json
    ```
 
    Use `mainnet` and the mainnet descriptor/manifest for a mainnet release.

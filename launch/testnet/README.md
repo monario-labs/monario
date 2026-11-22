@@ -1,6 +1,6 @@
-# Monario testnet rehearsal bundle
+# Monario testnet launch bundle
 
-This candidate defines a testnet only. `root.json` describes the zero-supply
+This frozen profile defines a testnet only. `root.json` describes the zero-supply
 height-zero anchor. `root-commitment.txt` is the public commitment preimage.
 `node.json` contains the matching network and consensus parameters. Keep the
 commitment file in UTF-8 with LF line endings and a final newline.
@@ -13,30 +13,34 @@ From this directory, using a qualified `monario-launch` binary:
 sha256sum root-commitment.txt
 monario-launch root-check root.json node.json
 monario-launch check node.json --strict
+monario-launch bootstrap-check testnet --bundled node.json
 ```
 
-Compare the SHA-256 result with `root_commitment` in `root.json`. Both commands
+Compare the SHA-256 result with `root_commitment` in `root.json`. All three commands
 must report this validation profile:
 
 ```text
 fb9a57f8dfb02c16822ded5440d0147864cd3e5a0dadcc568a24ff41cd53b02b
 ```
 
-The strict manifest check covers recommended parameters. Also review the
-chain ID, root and difficulty fields, which are explicit operator inputs.
+The bundled check verifies the descriptor compiled into the binary. In the
+release archive, `bootstrap.json` is its public copy and `peers.json` is the
+matching signed envelope, staged for `https://testnet.monario.org/testnet/peers.json`.
+The list expires on 2027-02-01 at 00:00 UTC. Before launch, check that the seed
+still holds the pinned identity and is reachable on its advertised port.
 
 ## Starting difficulty
 
 The initial target (`0x1f074822`) gives roughly 9,000 hashes per accepted
 block on average, or a 90-second initial interval at an assumed combined
-100 hashes/second. Benchmark participating CPUs before freezing the launch
-configuration. The PoW limit (`0x2000ffff`) permits approximately 256 hashes
+100 hashes/second. The PoW limit (`0x2000ffff`) permits approximately 256 hashes
 per block at the easiest target. ASERT uses a six-hour half-life.
 
-The anchor timestamp is 2026-11-21 19:49 UTC. A delay between this timestamp
-and the first mined block affects ASERT from block 2. If operators rehearse
-substantially later, prepare a fresh record and manifest near the planned
-start, verify the resulting profile and distribute the new bundle together.
+The anchor timestamp is 2026-11-21 19:49 UTC. From block 2, ASERT accounts for
+elapsed time from this anchor, so a later first block can lower the difficulty
+toward the PoW limit. Replacing the anchor or difficulty changes the profile
+and requires a matching seed identity, a newly signed list and a rebuilt
+release.
 
 ## Release hygiene
 

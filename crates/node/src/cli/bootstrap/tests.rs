@@ -200,13 +200,13 @@ fn bootstrap_replay_and_expiry_keep_the_durable_sequence_floor() {
 fn bootstrap_release_check_stays_offline_and_fails_closed() {
     let bytes = descriptor(&signed_list(1, 100, "8.8.8.8:19445"));
     assert_eq!(
-        check("testnet", PROFILE, &bytes, 99).unwrap()["network_started"],
+        check("testnet", PROFILE, Some(&bytes), 99).unwrap()["network_started"],
         false
     );
-    assert!(check("testnet", PROFILE, &bytes, 100).is_err());
-    assert!(check("mainnet", PROFILE, &bytes, 99).is_err());
-    assert!(check("testnet", [1; 32], &bytes, 99).is_err());
-    assert!(check("testnet", PROFILE, b"null", 99).is_err());
+    assert!(check("testnet", PROFILE, Some(&bytes), 100).is_err());
+    assert!(check("mainnet", PROFILE, Some(&bytes), 99).is_err());
+    assert!(check("testnet", [1; 32], Some(&bytes), 99).is_err());
+    assert!(check("testnet", PROFILE, Some(b"null"), 99).is_err());
     assert_eq!(
         Network::Mainnet.url(),
         "https://node.monario.org/mainnet/peers.json"
@@ -218,4 +218,23 @@ fn bootstrap_release_check_stays_offline_and_fails_closed() {
     let dir = tempfile::tempdir().unwrap();
     assert!(startup(dir.path(), [0; 32]).unwrap().is_empty());
     assert!(!dir.path().join(CACHE).exists());
+}
+
+#[test]
+fn bootstrap_embedded_testnet_matches_shipped_manifest_and_publishable_envelope() {
+    let manifest = include_bytes!("../../../../../launch/testnet/node.json");
+    let (profile, launch) = crate::cli::manifest::profile(manifest).unwrap();
+    let summary = check("testnet", profile, None, launch.root.timestamp).unwrap();
+    assert_eq!(summary["network_started"], false);
+    assert!(summary["seeds"].as_u64().unwrap() > 0);
+    assert!(check("mainnet", profile, None, launch.root.timestamp).is_err());
+
+    let (trust, fallback) = bundle(Network::Testnet.embedded(), Network::Testnet, profile)
+        .unwrap()
+        .unwrap();
+    let publishable = trust
+        .decode(include_bytes!("../../../../../launch/testnet/peers.json"))
+        .unwrap();
+    assert_eq!(publishable.envelope.payload, fallback.envelope.payload);
+    assert_eq!(publishable.envelope.signature, fallback.envelope.signature);
 }

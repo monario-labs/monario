@@ -11,11 +11,11 @@ mod pool_verify;
 pub mod root;
 mod transaction_get;
 
-/// Check a proposed release bootstrap descriptor against a trusted profile offline.
+/// Check a supplied descriptor or the compiled-in fallback against a trusted profile offline.
 pub fn verify_bootstrap_bundle(
     network: &str,
     profile: [u8; 32],
-    bytes: &[u8],
+    bytes: Option<&[u8]>,
     now: u64,
 ) -> Result<serde_json::Value, Error> {
     bootstrap::check(network, profile, bytes, now)
