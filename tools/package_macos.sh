@@ -21,6 +21,10 @@ if ! rustc -vV | grep -Fxq "host: $expected_host"; then
     exit 1
 fi
 
+# SQLite's no-follow mode rejects /var when it aliases /private/var.
+TMPDIR=$(cd "${TMPDIR:-/tmp}" && pwd -P)
+export TMPDIR
+
 python3 tools/verify_vendor.py
 cargo test --locked --offline -p monario-wallet-gui --lib
 for test in pool_mode_is_explicit_bounded_and_has_no_silent_fallback \
