@@ -533,6 +533,29 @@ fn coins_are_parsed_and_filtered() {
 }
 
 #[test]
+fn wallet_creation_and_reopen_receipts_expose_the_checkpoint() {
+    let receipt = serde_json::json!({
+        "wallet_id": "ab".repeat(16),
+        "network": "test",
+        "revision": "0",
+        "recovery_required": false
+    });
+    assert_eq!(checkpoint_of(&receipt), Some(("ab".repeat(16), 0)));
+
+    let mut malformed = receipt.clone();
+    malformed["wallet_id"] = serde_json::json!("invalid");
+    assert!(checkpoint_of(&malformed).is_none());
+
+    let mut malformed = receipt.clone();
+    malformed["revision"] = serde_json::json!("18446744073709551616");
+    assert!(checkpoint_of(&malformed).is_none());
+
+    let mut ambiguous = receipt;
+    ambiguous["checkpoint"] = serde_json::Value::Null;
+    assert!(checkpoint_of(&ambiguous).is_none());
+}
+
+#[test]
 fn receipts_expose_checkpoint_updates() {
     let wallet = serde_json::json!({
         "checkpoint": {"wallet_id": "ab".repeat(16), "network": "main", "revision": "9", "recovery_required": false},

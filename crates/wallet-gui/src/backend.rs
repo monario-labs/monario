@@ -1784,13 +1784,14 @@ pub fn field_u64(value: &serde_json::Value, key: &str) -> Option<u64> {
 }
 
 pub fn checkpoint_of(value: &serde_json::Value) -> Option<(String, u64)> {
-    let checkpoint = value.get("checkpoint")?;
-    let id = checkpoint.get("wallet_id")?.as_str()?.to_owned();
+    let checkpoint = value.get("checkpoint").unwrap_or(value);
+    let id = checkpoint.get("wallet_id")?.as_str()?;
+    validate_hex(id, 16, "wallet id").ok()?;
     let revision = checkpoint
         .get("revision")
         .and_then(|v| v.as_str())
         .and_then(|v| v.parse().ok())?;
-    Some((id, revision))
+    Some((id.to_owned(), revision))
 }
 
 pub fn node_checkpoint_of(value: &serde_json::Value) -> Option<(String, u64)> {

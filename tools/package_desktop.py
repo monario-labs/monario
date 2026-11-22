@@ -7,6 +7,7 @@ import json
 import os
 import plistlib
 import re
+import secrets
 import subprocess
 import sys
 import tarfile
@@ -16,8 +17,8 @@ import zipfile
 
 def verify_package(read, bin_dir, platform):
     """Run offline checks against the exact archived binaries and configuration."""
-    def run(args, cwd):
-        result = subprocess.run(args, cwd=cwd, capture_output=True, check=False, timeout=30)
+    def run(args, cwd, *, stdin=None):
+        result = subprocess.run(args, cwd=cwd, input=stdin, capture_output=True, check=False, timeout=30)
         if result.returncode != 0:
             raise SystemExit("Desktop package smoke check failed")
         return result.stdout
@@ -55,6 +56,24 @@ def verify_package(read, bin_dir, platform):
             raise SystemExit("Desktop package testnet configuration failed verification")
         run([wallet, "--version"], root)
         run([node, "--version"], root)
+        password = secrets.token_hex(32).encode("ascii")
+        frame = len(password).to_bytes(2, "little") + password
+        wallet_args = ["--directory", ".", "--name", "package-smoke", "--network", "test", "--password-stdin"]
+        created = json.loads(run([wallet, "create", *wallet_args], root, stdin=frame * 2))
+        wallet_id = created.get("wallet_id", "")
+        expected = {"wallet_id": wallet_id, "network": "test", "revision": "0", "recovery_required": False}
+        if not re.fullmatch(r"[a-f0-9]{32}", wallet_id) or created != expected:
+            raise SystemExit("Desktop package wallet creation receipt failed verification")
+        for kind, prefix, revision in (("transparent", "testmont1", "1"), ("private", "testmonz1", "2")):
+            selector = ["--wallet-id", wallet_id, "--revision", expected["revision"]]
+            opened = json.loads(run([wallet, "info", *wallet_args, *selector], root, stdin=frame))
+            if opened != expected:
+                raise SystemExit("Desktop package wallet reopen receipt failed verification")
+            issued = json.loads(run([wallet, "address", *wallet_args, *selector, "--type", kind, "--account", "0"],
+                                    root, stdin=frame))
+            expected["revision"] = revision
+            if issued.get("checkpoint") != expected or not issued.get("address", "").startswith(prefix):
+                raise SystemExit("Desktop package wallet address receipt failed verification")
 
 
 def main():

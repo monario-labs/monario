@@ -181,11 +181,15 @@ impl Banner {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum JobTag {
-    Unlock,
-    Create,
-    Recover,
+    Unlock(WalletRef),
+    Create {
+        directory: String,
+        name: String,
+        network: backend::Network,
+    },
+    Recover(WalletRef),
     Address,
     Balance,
     Inputs,
@@ -415,6 +419,7 @@ impl GuiApp {
             state,
         };
         if let Some(wallet) = app.state.wallet.clone() {
+            app.open_mode = OpenMode::Open;
             app.form_dir = wallet.directory.clone();
             app.form_name = wallet.name.clone();
             app.form_network = wallet.network;
@@ -594,7 +599,14 @@ impl GuiApp {
         }
         let spec = backend::wallet_create(&directory, &name, self.form_network, &self.password);
         self.last_action = "Creating wallet".into();
-        self.spawn(JobTag::Create, spec);
+        self.spawn(
+            JobTag::Create {
+                directory,
+                name,
+                network: self.form_network,
+            },
+            spec,
+        );
     }
 
     pub(crate) fn open_wallet(&mut self) {
@@ -624,7 +636,7 @@ impl GuiApp {
         }
         let spec = backend::wallet_info(&wallet, &self.password);
         self.last_action = "Verifying wallet".into();
-        self.spawn(JobTag::Unlock, spec);
+        self.spawn(JobTag::Unlock(wallet), spec);
     }
 
     pub(crate) fn recover_wallet(&mut self) {
@@ -662,7 +674,16 @@ impl GuiApp {
             &self.new_password,
         );
         self.last_action = "Recovering an encrypted backup".into();
-        self.spawn(JobTag::Recover, spec);
+        self.spawn(
+            JobTag::Recover(WalletRef {
+                directory,
+                name: new_name,
+                network: self.form_network,
+                wallet_id,
+                revision,
+            }),
+            spec,
+        );
     }
 
     pub(crate) fn pull_remote(&mut self) {
@@ -1576,8 +1597,10 @@ impl GuiApp {
         if let Some((id, revision)) = backend::checkpoint_of(value)
             && let Some(wallet) = self.state.wallet.as_mut()
             && wallet.wallet_id == id
+            && wallet.revision < revision
         {
             wallet.revision = revision;
+            self.form_revision = revision.to_string();
             self.persist();
         }
     }
@@ -1593,60 +1616,78 @@ impl GuiApp {
         }
     }
 
+    fn select_wallet(&mut self, wallet: WalletRef) {
+        if !self.state.wallet.as_ref().is_some_and(|current| {
+            current.wallet_id == wallet.wallet_id
+                && current.directory == wallet.directory
+                && current.name == wallet.name
+        }) {
+            self.balance = None;
+            self.coins.clear();
+            self.inputs_tip.clear();
+            self.addresses.clear();
+            self.send_coins.clear();
+            self.service_coins.clear();
+            self.pending_request = None;
+            self.construct = None;
+            self.service_construct = None;
+            self.exported_hex.clear();
+            self.last_status = None;
+            self.confirm_reserve = false;
+        }
+        self.form_dir.clone_from(&wallet.directory);
+        self.form_name.clone_from(&wallet.name);
+        self.form_wallet_id.clone_from(&wallet.wallet_id);
+        self.form_revision = wallet.revision.to_string();
+        self.open_mode = OpenMode::Open;
+        self.state.wallet = Some(wallet);
+    }
+
     fn handle(&mut self, tag: JobTag, value: serde_json::Value) {
-        self.apply_wallet_checkpoint(&value);
+        if value.get("checkpoint").is_some() || tag == JobTag::PasswordChange {
+            self.apply_wallet_checkpoint(&value);
+        }
         self.apply_node_checkpoint(&value);
         match tag {
-            JobTag::Unlock => {
-                let wallet = match (&self.state.wallet, backend::checkpoint_of(&value)) {
-                    (Some(wallet), _) => wallet.clone(),
-                    (None, Some((id, revision))) => WalletRef {
-                        directory: self.form_dir.trim().to_owned(),
-                        name: self.form_name.trim().to_owned(),
-                        network: self.form_network,
-                        wallet_id: id,
-                        revision,
-                    },
-                    _ => {
-                        self.error("the wallet receipt was not understood");
-                        return;
-                    }
+            JobTag::Unlock(mut wallet) => {
+                let Some((id, revision)) = backend::checkpoint_of(&value) else {
+                    self.error("the wallet receipt was not understood");
+                    return;
                 };
-                let id = backend::checkpoint_of(&value)
-                    .map(|(id, _)| id)
-                    .unwrap_or_default();
-                let revision = backend::checkpoint_of(&value)
-                    .map(|(_, revision)| revision)
-                    .unwrap_or(0);
-                let mut wallet = wallet;
-                if !id.is_empty() {
-                    wallet.wallet_id = id;
-                    wallet.revision = revision;
+                if id != wallet.wallet_id
+                    || revision < wallet.revision
+                    || value["network"].as_str() != Some(wallet.network.as_str())
+                {
+                    self.error("the wallet receipt does not match the requested wallet");
+                    return;
                 }
-                self.state.wallet = Some(wallet.clone());
-                self.form_wallet_id = wallet.wallet_id.clone();
-                self.form_revision = wallet.revision.to_string();
+                wallet.revision = revision;
+                self.select_wallet(wallet);
                 self.unlocked = true;
                 self.page = Page::Overview;
                 self.success("Wallet unlocked.");
                 self.persist();
             }
-            JobTag::Create => {
+            JobTag::Create {
+                directory,
+                name,
+                network,
+            } => {
                 let Some((id, revision)) = backend::checkpoint_of(&value) else {
                     self.error("the wallet receipt was not understood");
                     return;
                 };
-                let wallet = WalletRef {
-                    directory: self.form_dir.trim().to_owned(),
-                    name: self.form_name.trim().to_owned(),
-                    network: self.form_network,
+                if revision != 0 || value["network"].as_str() != Some(network.as_str()) {
+                    self.error("the wallet creation receipt does not match the request");
+                    return;
+                }
+                self.select_wallet(WalletRef {
+                    directory,
+                    name,
+                    network,
                     wallet_id: id,
                     revision,
-                };
-                self.form_wallet_id = wallet.wallet_id.clone();
-                self.form_revision = wallet.revision.to_string();
-                self.state.wallet = Some(wallet);
-                self.unlocked = true;
+                });
                 self.password.clear();
                 self.confirm.clear();
                 self.page = Page::Overview;
@@ -1654,7 +1695,7 @@ impl GuiApp {
                 self.unlocked = false;
                 self.persist();
             }
-            JobTag::Recover => {
+            JobTag::Recover(mut wallet) => {
                 let Some((id, revision)) = backend::checkpoint_of(&value) else {
                     self.error("the recovery receipt was not understood");
                     return;
@@ -1663,16 +1704,15 @@ impl GuiApp {
                     .get("recovery_required")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
-                let wallet = WalletRef {
-                    directory: self.form_dir.trim().to_owned(),
-                    name: self.form_new_name.trim().to_owned(),
-                    network: self.form_network,
-                    wallet_id: id.clone(),
-                    revision,
-                };
-                self.form_wallet_id = id;
-                self.form_revision = revision.to_string();
-                self.state.wallet = Some(wallet);
+                if id != wallet.wallet_id
+                    || revision < wallet.revision
+                    || value["network"].as_str() != Some(wallet.network.as_str())
+                {
+                    self.error("the recovery receipt does not match the requested wallet");
+                    return;
+                }
+                wallet.revision = revision;
+                self.select_wallet(wallet);
                 self.unlocked = false;
                 self.password.clear();
                 self.new_password.clear();
@@ -2194,7 +2234,9 @@ impl GuiApp {
                                 );
                             });
                             ui.add_space(6.0);
-                            crate::pages::onboard_form(self, ui);
+                            ui.add_enabled_ui(!self.is_busy(), |ui| {
+                                crate::pages::onboard_form(self, ui);
+                            });
                         });
                     ui.add_space(12.0);
                     ui.label(theme::caption(
