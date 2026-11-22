@@ -9,6 +9,7 @@ publish = false
 monario-chain = { path = "../chain" }
 monario-v6 = { path = "../v6" }
 getrandom = "=0.4.3"
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }
 sha2 = "=0.10.9"
 snow = { version = "=0.10.0", default-features = false, features = ["use-curve25519", "use-chacha20poly1305", "use-sha2", "use-getrandom"] }
 zeroize = "=1.9.1"
@@ -18,6 +19,8 @@ chacha20poly1305 = { version = "=0.11.0", default-features = false, features = [
 rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
+tempfile = "=3.27.0"
+ureq = { version = "=3.5.2", default-features = false, features = ["native-tls-no-default"] }
 ctrlc = { version = "=3.4.5", features = ["termination"] }
 monario-monetary = { path = "../.." }
 monario-address = { path = "../address" }
@@ -27,7 +30,6 @@ monario-wallet-scan = { path = "../wallet-scan" }
 
 [dev-dependencies]
 monario-wallet = { path = "../wallet" }
-tempfile = "=3.27.0"
 zcash_primitives = { version = "=0.31.0", default-features = false, features = ["std"] }
 zcash_protocol = "=0.11.0"
 zcash_transparent = "=0.11.0"

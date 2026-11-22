@@ -22,7 +22,9 @@ pool credentials. The GUI starts work only after an explicit action.
 
 Use Rust 1.96 or later, Python 3, CMake, and a native C/C++ toolchain. Windows
 uses Visual Studio 2022 Build Tools and LLVM objcopy. Build Linux releases on
-Ubuntu 24.04 or a compatible baseline with X11, Wayland, OpenGL and binutils.
+Ubuntu 24.04 or a compatible baseline with X11, Wayland, OpenGL, binutils, and
+OpenSSL development libraries (`libssl-dev` on Ubuntu). The Linux node uses
+the system OpenSSL runtime for HTTPS seed discovery.
 The packager rejects executables that require a glibc version newer than 2.39.
 macOS uses Xcode Command Line Tools and a separate native build on Intel and
 Apple silicon.

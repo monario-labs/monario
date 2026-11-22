@@ -5,7 +5,13 @@
 //! manifest or root record. It never creates a root, genesis block, chain
 //! database, key or network connection, and it reads no password.
 use monario_node::cli::{manifest, root};
-use std::{env, fs, io::Write, path::Path, process::ExitCode};
+use std::{
+    env, fs,
+    io::Write,
+    path::Path,
+    process::ExitCode,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 fn main() -> ExitCode {
     match run() {
@@ -46,10 +52,28 @@ fn run() -> Result<(), ()> {
         [action, path] if action == "root-check" => check_root(path, None),
         [action, path, node] if action == "root-check" => check_root(path, Some(node)),
         [action, path] if action == "finality-check" => check_finality(path),
+        [action, network, descriptor, node] if action == "bootstrap-check" => {
+            let (profile, _) = manifest::profile(&bounded(node, 16_384)?).map_err(|_| ())?;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| ())?
+                .as_secs();
+            let summary = monario_node::cli::verify_bootstrap_bundle(
+                network,
+                profile,
+                &bounded(descriptor, 32_768)?,
+                now,
+            )
+            .map_err(|_| {
+                eprintln!("invalid bootstrap bundle");
+            })?;
+            write_stdout(&summary.to_string())
+        }
         _ => {
             eprintln!(
                 "usage: monario-launch template | check NAME.json [--strict] | root-preimage | \
-                 root-check ROOT.json [NAME.json] | finality-check NAME.json"
+                 root-check ROOT.json [NAME.json] | finality-check NAME.json | \
+                 bootstrap-check mainnet|testnet DESCRIPTOR.json NAME.json"
             );
             Err(())
         }

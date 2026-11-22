@@ -37,6 +37,35 @@ fn fixture() -> (tempfile::TempDir, IdentityDirectory, IdentityStore) {
 }
 
 #[test]
+fn bootstrap_seeds_are_bounded_and_do_not_replace_sealed_operator_peers() {
+    let _guard = VAULT.lock().unwrap();
+    let (_temp, _dir, store) = fixture();
+    let manual = store.configuration().unwrap().peers()[0].clone();
+    let candidate = |ip: u8, public_key| PeerTarget {
+        address: format!("8.8.8.{ip}:1").parse().unwrap(),
+        public_key,
+    };
+    let mut seeds = vec![
+        PeerTarget {
+            address: manual.address,
+            public_key: peer_key(12),
+        },
+        candidate(1, manual.public_key),
+        candidate(2, identity().public_key()),
+    ];
+    seeds.extend((30..70).map(|n| candidate(n, peer_key(n))));
+    let driver = store.into_driver_with_seeds(seeds).unwrap();
+    assert_eq!(
+        driver.store.configuration().unwrap().peers(),
+        std::slice::from_ref(&manual)
+    );
+    assert_eq!(driver.driver.config.connect.len(), 32);
+    assert_eq!(driver.driver.config.connect[0], manual);
+    assert_eq!(driver.driver.config.connect[1], candidate(30, peer_key(30)));
+    assert_eq!(driver.checkpoint().unwrap().revision, 0);
+}
+
+#[test]
 fn strict_configuration_schema_bounds_addresses_and_keys() {
     let base: serde_json::Value = serde_json::from_slice(&document(11)).unwrap();
     for attack in 0..14 {

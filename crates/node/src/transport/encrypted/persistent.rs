@@ -5,7 +5,7 @@ mod sqlite;
 use super::Identity;
 use crate::{
     Clock, Error, Node,
-    transport::{TcpConfig, TcpDriver},
+    transport::{PeerTarget, TcpConfig, TcpDriver},
 };
 pub use config::TrustedPeers;
 use rusqlite::Connection;
@@ -246,12 +246,33 @@ impl IdentityStore {
     /// Retains the exclusive database owner throughout the driver's lifetime.
     /// Construction opens no sockets and configures no automatic identity/pin changes.
     pub fn into_driver(self) -> Result<PersistentDriver, StoreError> {
+        self.into_driver_with_seeds(Vec::new())
+    }
+    /// Add verified bootstrap targets to this run's dial plan. The sealed
+    /// operator configuration and advertised peers never include these targets.
+    pub(crate) fn into_driver_with_seeds(
+        self,
+        seeds: Vec<PeerTarget>,
+    ) -> Result<PersistentDriver, StoreError> {
         self.ready()?;
         let identity = Identity::from_secret(self.identity.0.clone());
+        let mut connect = self.config.peers.clone();
+        for seed in seeds {
+            if connect.len() == 32 {
+                break;
+            }
+            if seed.public_key != identity.public_key()
+                && !connect
+                    .iter()
+                    .any(|peer| peer.address == seed.address || peer.public_key == seed.public_key)
+            {
+                connect.push(seed);
+            }
+        }
         let driver = TcpDriver::new(TcpConfig {
             identity,
             listen: self.config.listen,
-            connect: self.config.peers.clone(),
+            connect,
         })
         .map_err(|_| StoreError::Invalid)?;
         Ok(PersistentDriver {

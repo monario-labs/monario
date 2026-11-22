@@ -1,6 +1,7 @@
 //! Strict offline administration and explicit existing-chain runtime activation.
 mod archive_audit;
 mod blocks;
+mod bootstrap;
 pub mod manifest;
 mod pool_config;
 mod pool_pay;
@@ -9,6 +10,16 @@ mod pool_status;
 mod pool_verify;
 pub mod root;
 mod transaction_get;
+
+/// Check a proposed release bootstrap descriptor against a trusted profile offline.
+pub fn verify_bootstrap_bundle(
+    network: &str,
+    profile: [u8; 32],
+    bytes: &[u8],
+    now: u64,
+) -> Result<serde_json::Value, Error> {
+    bootstrap::check(network, profile, bytes, now)
+}
 use crate::{
     Limits, Node,
     mining::operator::{
@@ -2009,7 +2020,19 @@ fn execute_with(
                     node.shutdown().map_err(|_| Error::Runtime)?;
                     return Err(error);
                 }
-                let driver = store.into_driver().map_err(|_| Error::Storage)?;
+                let seeds = if command.network && !stop.load(Ordering::Acquire) {
+                    bootstrap::startup(&root, node.profile).unwrap_or_else(|_| {
+                        eprintln!(
+                            "warning: signed peer bootstrap unavailable; using operator peers"
+                        );
+                        Vec::new()
+                    })
+                } else {
+                    Vec::new()
+                };
+                let driver = store
+                    .into_driver_with_seeds(seeds)
+                    .map_err(|_| Error::Storage)?;
                 if command.action == Action::PoolServer {
                     let config = pool_server.ok_or(Error::Configuration)?;
                     let identity = driver

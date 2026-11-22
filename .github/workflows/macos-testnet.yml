@@ -41,7 +41,7 @@ jobs:
           stage=$(mktemp -d "$RUNNER_TEMP/monario.XXXXXXXX")
           stage=$(cd "$stage" && pwd -P)
           mkdir "$stage/source"
-          tar -cf - Cargo.toml Cargo.lock crates src tests vendor launch/testnet \
+          tar -cf - Cargo.toml Cargo.lock crates src tests vendor launch/testnet launch/bootstrap \
             docs/desktop-release.md website/assets/monario-mark.png \
             tools/build_private.py tools/package_desktop.py tools/package_macos.sh \
             tools/verify_vendor.py | tar -xf - -C "$stage/source"
