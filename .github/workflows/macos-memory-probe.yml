@@ -1,0 +1,77 @@
+name: macOS memory probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ci/macos-memory-probe
+    paths:
+      - .github/workflows/macos-memory-probe.yml
+      - crates/randomx/src/resources/**
+      - crates/randomx/src/resources.rs
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: macOS ${{ matrix.arch }} memory probe
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            arch: x86_64
+            machine: x86_64
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            arch: arm64
+            machine: arm64
+            target: aarch64-apple-darwin
+    env:
+      RUSTUP_TOOLCHAIN: '1.96.1'
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+
+      - name: Run resource unit tests with the native memory probe
+        shell: bash
+        env:
+          EXPECTED_MACHINE: ${{ matrix.machine }}
+          EXPECTED_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          umask 077
+
+          test "$(uname -m)" = "$EXPECTED_MACHINE"
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          test "$host" = "$EXPECTED_TARGET"
+
+          stage=$(mktemp -d "$RUNNER_TEMP/monario-memory.XXXXXXXX")
+          stage=$(cd "$stage" && pwd -P)
+          cd "$stage"
+
+          # Standalone rustc build: no Cargo manifest, dependency resolution,
+          # network access, or build artifacts outside this scratch directory.
+          rustc --edition=2024 --test \
+            --remap-path-prefix "$GITHUB_WORKSPACE=/monario/source" \
+            --remap-path-prefix "$RUNNER_TEMP=/monario/tmp" \
+            "$GITHUB_WORKSPACE/crates/randomx/src/resources.rs" \
+            -o "$stage/resources-tests"
+
+          # Fail if the native smoke test was compiled out of the test binary.
+          ./resources-tests --list > "$stage/tests.list"
+          grep -qx 'macos::tests::live_sample_is_bounded_by_physical_memory: test' \
+            "$stage/tests.list"
+
+          ./resources-tests
