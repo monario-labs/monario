@@ -1,7 +1,7 @@
 //! Screen composition. All actions go through `GuiApp` so the subprocess
 //! boundary stays in one place.
-use crate::app::{ControlUi, GuiApp, NodeKind, OpenMode, Page, atom_text};
-use crate::backend::{self, AddressKind, COLLATERAL_ATOMS, Network, PoolMode};
+use crate::app::{GuiApp, NodeKind, OpenMode, Page, atom_text};
+use crate::backend::{self, AddressKind, Network, PoolMode};
 use crate::theme::{self, *};
 use eframe::egui::{self, RichText, Vec2};
 
@@ -220,21 +220,20 @@ impl GuiApp {
         page_header(
             ui,
             "WORKSPACE / OVERVIEW",
-            "Your ledger at a glance",
-            "Confirmed balances come from a locally validated chain. Nothing here creates one.",
+            "Wallet overview",
+            "View your confirmed balance and receive MONAR.",
         );
 
         let balance = self.balance.clone();
         let address = self.addresses.first().cloned();
         let node_running = self.node.is_some();
         let busy = self.is_busy();
+        let scan_configured = self.state.source.validate().is_ok();
 
         let mut refresh = false;
-        let mut load = false;
         let mut derive = false;
         let mut copy: Option<String> = None;
-        let mut go_send = false;
-        let mut go_receive = false;
+        let mut go_node = false;
         let mut stop = false;
 
         card(ui, |ui| {
@@ -274,23 +273,23 @@ impl GuiApp {
                 }
             } else {
                 ui.label(theme::amount("— MONAR"));
-                ui.label(theme::caption(
-                    "No validated balance yet. Configure an existing chain and refresh.",
-                ));
+                ui.label(theme::caption(if scan_configured {
+                    "Refresh your balance to scan the configured chain."
+                } else {
+                    "Set up a chain source in Node to scan your balance."
+                }));
             }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(!busy, theme::button_secondary("Refresh balance"))
+                if scan_configured {
+                    refresh = ui
+                        .add_enabled(!busy, theme::button_secondary("Refresh balance"))
+                        .clicked();
+                } else if ui
+                    .add(theme::button_secondary("Set up balance scanning"))
                     .clicked()
                 {
-                    refresh = true;
-                }
-                if ui
-                    .add_enabled(!busy, theme::button_secondary("Load coins"))
-                    .clicked()
-                {
-                    load = true;
+                    go_node = true;
                 }
             });
         });
@@ -298,39 +297,31 @@ impl GuiApp {
             ui.label(theme::section("RECEIVE"));
             ui.add_space(4.0);
             if let Some(address) = &address {
-                ui.horizontal(|ui| {
-                    theme::identicon(ui, &address.address, 92.0);
-                    ui.add_space(8.0);
-                    ui.vertical(|ui| {
-                        ui.label(theme::caption("Latest address"));
-                        ui.label(
-                            RichText::new(&address.address)
-                                .family(egui::FontFamily::Monospace)
-                                .size(12.5)
-                                .color(TEXT),
-                        );
-                        ui.label(theme::caption(&format!(
-                            "{} · index {}",
-                            address.kind, address.index
-                        )));
-                    });
-                });
+                ui.label(theme::caption("Latest address"));
+                ui.add(egui::Label::new(theme::mono(&address.address)).wrap());
+                ui.label(theme::caption(&format!(
+                    "{} · index {}",
+                    address.kind, address.index
+                )));
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.add(theme::button_secondary("Copy address")).clicked() {
                         copy = Some(address.address.clone());
                     }
-                    if ui.add(theme::button_secondary("New address")).clicked() {
+                    if ui
+                        .add_enabled(!busy, theme::button_secondary("New transparent address"))
+                        .clicked()
+                    {
                         derive = true;
                     }
                 });
             } else {
                 ui.label(theme::caption(
-                    "Derive a transparent address to receive funds.",
+                    "Create a transparent address to receive MONAR.",
                 ));
                 ui.add_space(8.0);
                 if ui
-                    .add_enabled(!busy, theme::button_primary("Derive address"))
+                    .add_enabled(!busy, theme::button_primary("New transparent address"))
                     .clicked()
                 {
                     derive = true;
@@ -353,10 +344,11 @@ impl GuiApp {
             }
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.add(theme::button_secondary("Open node panel")).clicked() {
-                    go_send = false;
-                    go_receive = false;
-                    self.page = Page::Node;
+                if ui
+                    .add(theme::button_secondary("Open node settings"))
+                    .clicked()
+                {
+                    go_node = true;
                 }
                 if node_running && ui.add(theme::button_danger("Stop node")).clicked() {
                     stop = true;
@@ -371,9 +363,6 @@ impl GuiApp {
         if refresh {
             self.refresh_balance();
         }
-        if load {
-            self.load_coins();
-        }
         if derive {
             self.new_address(AddressKind::Transparent);
         }
@@ -381,28 +370,8 @@ impl GuiApp {
             self.stop_node();
         }
 
-        card(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(theme::section("QUICK ACTIONS"));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(theme::button_secondary("Mining")).clicked() {
-                        self.page = Page::Mining;
-                    }
-                    if ui.add(theme::button_secondary("Send")).clicked() {
-                        go_send = true;
-                    }
-                });
-            });
-            ui.add_space(2.0);
-            ui.label(theme::caption(
-                "Sending reserves exact input claims before signing.",
-            ));
-        });
-        if go_send {
-            self.page = Page::Send;
-        }
-        if go_receive {
-            self.page = Page::Receive;
+        if go_node {
+            self.page = Page::Node;
         }
 
         if !self.activity.is_empty() {
@@ -420,47 +389,61 @@ impl GuiApp {
         page_header(
             ui,
             "WORKSPACE / SEND",
-            "Move value deliberately",
-            "A signed transaction durably claims its inputs. Review before you sign.",
+            "Send MONAR",
+            "Select transparent funds, enter a recipient and review the amount and fee before signing.",
         );
 
         let busy = self.is_busy();
         let coins = self.coins.clone();
-        let balance = self.balance.clone();
+        let scan_configured = self.state.source.validate().is_ok();
+        let inputs_height = self.inputs_height;
         let construct = self.construct.clone();
         let mut load = false;
         let mut sign = false;
 
         card(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(theme::section("SOURCE"));
+                ui.label(theme::section("SPENDABLE FUNDS"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add_enabled(!busy, theme::button_secondary("Reload coins & balance"))
+                    if scan_configured {
+                        load = ui
+                            .add_enabled(
+                                !busy,
+                                theme::button_secondary("Scan for spendable outputs"),
+                            )
+                            .clicked();
+                    } else if ui
+                        .add(theme::button_secondary("Set up chain source"))
                         .clicked()
                     {
-                        load = true;
+                        self.page = Page::Node;
                     }
                 });
             });
-            if let Some(balance) = &balance {
-                theme::key_value(ui, "Validated tip", &GuiApp::short(&balance.tip));
-                theme::key_value(ui, "Height", &balance.height.to_string());
+            if let Some(height) = inputs_height {
+                theme::key_value(ui, "Validated tip", &GuiApp::short(&self.inputs_tip));
+                theme::key_value(ui, "Height", &height.to_string());
             } else {
-                ui.label(theme::caption(
-                    "Refresh the validated balance before building.",
-                ));
+                ui.label(theme::caption(if scan_configured {
+                    "Scan the local chain to find funds available to spend."
+                } else {
+                    "Set up a chain source in Node before sending."
+                }));
             }
         });
 
         card(ui, |ui| {
-            ui.label(theme::section("SELECT TRANSPARENT COINS"));
+            ui.label(theme::section("SELECT TRANSPARENT OUTPUTS"));
             ui.label(theme::caption(
-                "Only mature, unreserved transparent coins can be spent. Private notes stay off this screen.",
+                "Select outputs that are mature and aren't already reserved by a signed transaction.",
             ));
             ui.add_space(4.0);
             if coins.is_empty() {
-                ui.label(theme::caption("No coins loaded."));
+                ui.label(theme::caption(if inputs_height.is_some() {
+                    "No unspent transparent outputs found."
+                } else {
+                    "Outputs appear here after scanning."
+                }));
             } else {
                 egui::ScrollArea::vertical()
                     .max_height(190.0)
@@ -513,7 +496,12 @@ impl GuiApp {
             ui.label(theme::section("PAYMENT"));
             ui.add_space(4.0);
             ui.label(theme::caption("Recipient address"));
-            theme::field(ui, &mut self.send_address, "rmont1…");
+            let hint = match self.form_network {
+                Network::Main => "mont1… or monz1…",
+                Network::Test => "testmont1… or testmonz1…",
+                Network::Regtest => "rmont1… or rmonz1…",
+            };
+            theme::field(ui, &mut self.send_address, hint);
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 let half = (ui.available_width() - 10.0) * 0.5;
@@ -579,8 +567,12 @@ impl GuiApp {
             ui.add_space(6.0);
             if ui
                 .add_enabled(
-                    !busy && self.confirm_reserve && balance_atoms > 0,
-                    theme::button_primary("Review and sign"),
+                    !busy
+                        && scan_configured
+                        && inputs_height.is_some()
+                        && self.confirm_reserve
+                        && balance_atoms > 0,
+                    theme::button_primary("Sign transaction"),
                 )
                 .clicked()
             {
@@ -634,7 +626,10 @@ impl GuiApp {
             });
             ui.add_space(6.0);
             if ui
-                .add_enabled(!busy, theme::button_secondary("Estimate fee"))
+                .add_enabled(
+                    !busy && scan_configured,
+                    theme::button_secondary("Estimate fee"),
+                )
                 .clicked()
             {
                 self.estimate_fee();
@@ -718,7 +713,7 @@ impl GuiApp {
         }
 
         if load {
-            self.load_coins();
+            self.refresh_spendable_outputs();
         }
         if sign {
             self.construct_payment();
@@ -729,8 +724,8 @@ impl GuiApp {
         page_header(
             ui,
             "WORKSPACE / RECEIVE",
-            "Addresses you control",
-            "Address derivation is offline. No private key or seed is ever exported.",
+            "Receive MONAR",
+            "Create a transparent or private address to share with the sender.",
         );
         let busy = self.is_busy();
         let mut transparent = false;
@@ -738,10 +733,8 @@ impl GuiApp {
         let mut copy: Option<String> = None;
 
         card(ui, |ui| {
-            ui.label(theme::section("DERIVE A FRESH ADDRESS"));
-            ui.label(theme::caption(
-                "Always share a fresh address. The wallet tracks the exact derivation index.",
-            ));
+            ui.label(theme::section("NEW RECEIVE ADDRESS"));
+            ui.label(theme::caption("Use a fresh address for each payment."));
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui
@@ -767,27 +760,18 @@ impl GuiApp {
             for address in &self.addresses {
                 card(ui, |ui| {
                     ui.horizontal(|ui| {
-                        theme::identicon(ui, &address.address, 76.0);
-                        ui.add_space(10.0);
-                        ui.vertical(|ui| {
-                            ui.label(theme::section(address.kind.to_uppercase().as_str()));
-                            ui.label(
-                                RichText::new(&address.address)
-                                    .family(egui::FontFamily::Monospace)
-                                    .size(13.0)
-                                    .color(TEXT),
-                            );
-                            ui.label(theme::caption(&format!(
-                                "derivation index {}",
-                                address.index
-                            )));
-                        });
+                        ui.label(theme::section(address.kind.to_uppercase().as_str()));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.add(theme::button_secondary("Copy")).clicked() {
+                            if ui.add(theme::button_secondary("Copy address")).clicked() {
                                 copy = Some(address.address.clone());
                             }
                         });
                     });
+                    ui.add(egui::Label::new(theme::mono(&address.address)).wrap());
+                    ui.label(theme::caption(&format!(
+                        "Derivation index {}",
+                        address.index
+                    )));
                 });
             }
         }
@@ -804,356 +788,16 @@ impl GuiApp {
         }
     }
 
-    pub(crate) fn smartnode(&mut self, ui: &mut egui::Ui) {
-        page_header(
-            ui,
-            "WORKSPACE / SMARTNODE",
-            "Bond 1000 MONAR and serve the network",
-            "Registration records archival service on the validated chain.",
-        );
-
-        card(ui, |ui| {
-            ui.label(theme::section("SERVICE RULES"));
-            ui.add_space(4.0);
-            egui::Grid::new("service-rules")
-                .num_columns(2)
-                .spacing([18.0, 6.0])
-                .show(ui, |ui| {
-                    for (key, value) in [
-                        ("Collateral", "one unspent P2PKH coin of exactly 1000 MONAR"),
-                        ("Registration confirmations", "100 blocks"),
-                        ("Qualification", "7 proven days of sampled proofs"),
-                        ("Period", "1,920 blocks"),
-                        ("Proof window", "160 blocks, 4 samples"),
-                        ("Registry cap", "84,000 entries, 44 per slot"),
-                        ("Records", "at most 64 service records per block"),
-                    ] {
-                        ui.label(theme::caption(key));
-                        ui.label(theme::caption(value));
-                        ui.end_row();
-                    }
-                });
-            ui.add_space(4.0);
-            ui.label(theme::caption(
-                "The collateral is never spent by registration. Fee inputs must be separate coins. Owner and operator keys are distinct.",
-            ));
-        });
-
-        // Step 1: operator key.
-        card(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(theme::section("STEP 1 · OPERATOR KEY"));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add_enabled(!self.is_busy(), theme::button_secondary("Reserve key"))
-                        .clicked()
-                    {
-                        self.reserve_operator_key();
-                    }
-                });
-            });
-            match &self.operator_key {
-                Some(key) => {
-                    theme::key_value(ui, "Operator address", &key.address);
-                    theme::key_value(ui, "Public key", &GuiApp::short(&key.public_key));
-                    theme::key_value(ui, "Index", &key.index.to_string());
-                    ui.add_space(4.0);
-                    if ui.add(theme::button_secondary("Copy public key")).clicked() {
-                        ui.ctx().copy_text(key.public_key.clone());
-                    }
-                }
-                None => {
-                    ui.label(theme::caption(
-                        "Reserve a transparent external index. The private key stays encrypted in the wallet.",
-                    ));
-                }
-            }
-        });
-
-        // Step 2: collateral.
-        let collateral_coins: Vec<_> = self
-            .coins
-            .iter()
-            .filter(|coin| coin.atoms == COLLATERAL_ATOMS)
-            .cloned()
-            .collect();
-        let busy = self.is_busy();
-        card(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(theme::section("STEP 2 · COLLATERAL"));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add_enabled(!busy, theme::button_secondary("Reload coins"))
-                        .clicked()
-                    {
-                        self.load_coins();
-                    }
-                });
-            });
-            if collateral_coins.is_empty() {
-                ui.label(theme::caption(
-                    "No exact 1000 MONAR transparent coin is loaded. Send 1000 MONAR to a fresh transparent address, wait for maturity, then reload.",
-                ));
-            } else {
-                egui::ScrollArea::vertical()
-                    .max_height(140.0)
-                    .show(ui, |ui| {
-                        for coin in &collateral_coins {
-                            let key = (coin.transaction.clone(), coin.index);
-                            let mut chosen = self.collateral.as_ref() == Some(&key);
-                            ui.horizontal(|ui| {
-                                if ui
-                                    .add_enabled(
-                                        coin.selectable(),
-                                        egui::RadioButton::new(chosen, ""),
-                                    )
-                                    .clicked()
-                                {
-                                    chosen = true;
-                                    self.collateral = Some(key.clone());
-                                }
-                                ui.label(theme::mono(&GuiApp::short(&coin.transaction)));
-                                ui.label(theme::caption(&format!("#{}", coin.index)));
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        ui.label(theme::mono(&atom_text(coin.atoms)));
-                                    },
-                                );
-                            });
-                            if !coin.selectable() {
-                                ui.label(theme::caption(
-                                    "This coin is immature or already reserved.",
-                                ));
-                            }
-                        }
-                    });
-            }
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label(theme::caption("Owner key index"));
-                theme::field(ui, &mut self.owner_index, "0");
-            });
-            ui.label(theme::caption(
-                "The owner key must be the key that controls the collateral coin.",
-            ));
-        });
-
-        // Step 3: fee inputs and build.
-        card(ui, |ui| {
-            ui.label(theme::section("STEP 3 · REGISTRATION"));
-            ui.label(theme::caption(
-                "Select separate fee coins. Never select the collateral itself.",
-            ));
-            ui.add_space(4.0);
-            let collateral = self.collateral.clone();
-            egui::ScrollArea::vertical()
-                .max_height(150.0)
-                .show(ui, |ui| {
-                    for coin in &self.coins {
-                        if coin.atoms == COLLATERAL_ATOMS
-                            && collateral.as_ref() == Some(&(coin.transaction.clone(), coin.index))
-                        {
-                            continue;
-                        }
-                        let key = (coin.transaction.clone(), coin.index);
-                        let mut selected = self.service_coins.contains(&key);
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add_enabled(
-                                    coin.selectable(),
-                                    egui::Checkbox::without_text(&mut selected),
-                                )
-                                .changed()
-                            {
-                                if selected {
-                                    self.service_coins.insert(key.clone());
-                                } else {
-                                    self.service_coins.remove(&key);
-                                }
-                            }
-                            ui.label(theme::mono(&GuiApp::short(&coin.transaction)));
-                            ui.label(theme::caption(&format!("#{}", coin.index)));
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(theme::mono(&atom_text(coin.atoms)));
-                                },
-                            );
-                        });
-                    }
-                });
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                let third = (ui.available_width() - 20.0) / 3.0;
-                ui.allocate_ui_with_layout(
-                    Vec2::new(third, ui.available_height()),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        ui.label(theme::caption("Fee (MONAR)"));
-                        theme::field(ui, &mut self.service_fee, "0.001");
-                    },
-                );
-                ui.add_space(10.0);
-                ui.allocate_ui_with_layout(
-                    Vec2::new(third, ui.available_height()),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        ui.label(theme::caption("Max fee (MONAR)"));
-                        theme::field(ui, &mut self.service_max_fee, "0.01");
-                    },
-                );
-                ui.add_space(10.0);
-                ui.allocate_ui_with_layout(
-                    Vec2::new(third, ui.available_height()),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        ui.label(theme::caption("Expiry delta"));
-                        theme::field(ui, &mut self.service_expiry, "20");
-                    },
-                );
-            });
-            ui.add_space(8.0);
-            if ui
-                .add_enabled(!busy, theme::button_primary("Build registration"))
-                .clicked()
-            {
-                self.construct_registration();
-            }
-            if let Some(construct) = &self.service_construct {
-                ui.add_space(8.0);
-                theme::divider(ui);
-                ui.add_space(4.0);
-                ui.label(theme::section("REGISTRATION TRANSACTION"));
-                theme::key_value(
-                    ui,
-                    "Registration id",
-                    &GuiApp::short(&construct.transaction_id),
-                );
-                theme::key_value(ui, "Reservation", &GuiApp::short(&construct.reservation));
-                theme::key_value(ui, "Fee", &atom_text(construct.fee_atoms));
-                ui.add_space(6.0);
-                if ui
-                    .add_enabled(!busy, theme::button_primary("Submit registration"))
-                    .clicked()
-                {
-                    self.submit_registration();
-                }
-            }
-        });
-
-        // Step 4: status.
-        card(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(theme::section("STEP 4 · SERVICE STATUS"));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add_enabled(!busy, theme::button_secondary("Check status"))
-                        .clicked()
-                    {
-                        self.check_service_status();
-                    }
-                });
-            });
-            ui.label(theme::caption(
-                "Registration id (the registration transaction id)",
-            ));
-            theme::field(ui, &mut self.service_registration, "64 lowercase hex");
-            if let Some(status) = &self.service_status {
-                ui.add_space(6.0);
-                render_service_status(ui, status);
-            }
-        });
-
-        // Step 5: proof step.
-        card(ui, |ui| {
-            ui.label(theme::section("STEP 5 · ONE BOUNDED PROOF STEP"));
-            ui.label(theme::caption(
-                "This executes one sampled proof step. It is not a timer, a scheduler daemon or a network service.",
-            ));
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                let half = (ui.available_width() - 10.0) * 0.5;
-                ui.allocate_ui_with_layout(
-                    Vec2::new(half, ui.available_height()),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        ui.label(theme::caption("Step fee (MONAR)"));
-                        theme::field(ui, &mut self.schedule_fee, "0.001");
-                    },
-                );
-                ui.add_space(10.0);
-                ui.allocate_ui_with_layout(
-                    Vec2::new(half, ui.available_height()),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        ui.label(theme::caption("Period fee budget (MONAR)"));
-                        theme::field(ui, &mut self.schedule_budget, "1");
-                    },
-                );
-            });
-            ui.add_space(6.0);
-            if ui
-                .add_enabled(!busy, theme::button_secondary("Run one proof step"))
-                .clicked()
-            {
-                self.run_service_step();
-            }
-            ui.label(theme::caption(
-                "Uses the fee coins selected above and the pinned node inbox.",
-            ));
-        });
-
-        // Step 6: control authorization.
-        card(ui, |ui| {
-            ui.label(theme::section("OPTIONAL · PUBLIC CONTROL AUTHORIZATION"));
-            ui.label(theme::caption(
-                "Exports a public rotation or reactivation authorization. It contains no secret key.",
-            ));
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.control_purpose, ControlUi::Rotation, "Rotation");
-                ui.selectable_value(
-                    &mut self.control_purpose,
-                    ControlUi::Reactivation,
-                    "Reactivation",
-                );
-                ui.label(theme::caption("Operator index"));
-                theme::field(ui, &mut self.control_index, "0");
-                if ui
-                    .add_enabled(!busy, theme::button_secondary("Export"))
-                    .clicked()
-                {
-                    self.authorize_operator();
-                }
-            });
-            if !self.authorization.is_empty() {
-                ui.add_space(4.0);
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.authorization)
-                        .desired_rows(3)
-                        .desired_width(f32::INFINITY),
-                );
-            }
-        });
-
-        if let Some(status) = &self.last_status {
-            card(ui, |ui| {
-                ui.label(theme::section("LAST STEP RECEIPT"));
-                render_json_summary(ui, status);
-            });
-        }
-    }
-
     pub(crate) fn mining(&mut self, ui: &mut egui::Ui) {
         page_header(
             ui,
             "WORKSPACE / MINING",
-            "Local RandomX work, explicitly started",
-            "Each worker allocates a 256 MiB cache. Nothing starts until you press the button.",
+            "Mine MONAR",
+            "Choose solo or pool mining. Each RandomX worker uses a 256 MiB cache.",
         );
         let busy = self.is_busy();
         let running = self.node_kind == Some(NodeKind::Mine);
+        let node_ready = self.state.node.is_some() && !self.node_manifest.trim().is_empty();
         let mut start = false;
         let mut stop = false;
 
@@ -1183,7 +827,7 @@ impl GuiApp {
                 ui.add_space(12.0);
                 ui.checkbox(
                     &mut self.state.mining_network_enabled,
-                    "Allow the peer network (explicit)",
+                    "Connect to blockchain peers",
                 );
             });
             ui.label(theme::caption(
@@ -1206,7 +850,7 @@ impl GuiApp {
                 }
                 PoolMode::Official => {
                     ui.label(theme::caption(&format!(
-                        "Official pool: {}",
+                        "Preset endpoint: {}. Confirm availability and obtain credentials from the pool operator.",
                         backend::OFFICIAL_POOL_ADDRESS
                     )));
                 }
@@ -1236,15 +880,18 @@ impl GuiApp {
                 ));
                 ui.add_space(4.0);
                 ui.label(theme::caption(
-                    "Official is a published default name, not a verified identity: confirm the pool key out of band. No Stratum V2 interoperability is claimed. Shares are pool policy units, not payouts.",
+                    "Confirm the pool's public key with the operator. Pool shares are tracked separately from wallet payments.",
                 ));
             }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(
-                        !busy && !running,
-                        theme::button_primary("Start local miner"),
+                        !busy
+                            && self.node.is_none()
+                            && node_ready
+                            && !self.state.mining_address.trim().is_empty(),
+                        theme::button_primary("Start mining"),
                     )
                     .clicked()
                 {
@@ -1262,9 +909,13 @@ impl GuiApp {
                     "Enter a miner address first. The coinbase pays that transparent address.",
                 ));
             }
-            if self.state.node.is_none() {
+            if !node_ready {
                 ui.label(theme::caption(
-                    "A node identity and an existing validated chain are required.",
+                    "Configure a node identity and chain manifest in Node before mining.",
+                ));
+            } else if self.node.is_some() && !running {
+                ui.label(theme::caption(
+                    "Stop the running node before starting the miner.",
                 ));
             }
         });
@@ -1362,8 +1013,8 @@ impl GuiApp {
         page_header(
             ui,
             "WORKSPACE / NODE",
-            "A runtime you switch on",
-            "The node opens an existing validated chain. This panel never creates genesis or a new database.",
+            "Node settings",
+            "Configure the chain used for wallet scans and manage your local node.",
         );
         let busy = self.is_busy();
         let running = self.node.is_some();
@@ -1371,7 +1022,6 @@ impl GuiApp {
         let mut verify_identity = false;
         let mut create_inbox = false;
         let mut start_run = false;
-        let mut start_mine = false;
         let mut pull_remote = false;
         let mut stop = false;
         let mut copy: Option<String> = None;
@@ -1379,8 +1029,8 @@ impl GuiApp {
         card(ui, |ui| {
             ui.label(theme::section("NODE IDENTITY"));
             ui.label(theme::caption(
-                    "The identity protects a local submission inbox. The peers manifest defaults to listen:off with no peers.",
-                ));
+                "Set up a local node identity to sync and submit transactions.",
+            ));
             ui.add_space(4.0);
             ui.label(theme::caption("Directory"));
             theme::field(ui, &mut self.node_dir, "C:\\Monario\\node");
@@ -1577,7 +1227,7 @@ impl GuiApp {
             ));
             ui.add_space(4.0);
             ui.label(theme::caption("Remote scan endpoint (numeric HOST:PORT)"));
-            theme::field(ui, &mut self.state.remote_address, "127.0.0.1:19445");
+            theme::field(ui, &mut self.state.remote_address, "127.0.0.1:PORT");
             ui.add_space(4.0);
             ui.label(theme::caption(
                 "Scan public key from the node receipt (required unless loopback)",
@@ -1645,21 +1295,15 @@ impl GuiApp {
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(
-                        !busy && !running,
-                        theme::button_primary("Start node + network"),
+                        !busy
+                            && !running
+                            && self.state.node.is_some()
+                            && !self.node_manifest.trim().is_empty(),
+                        theme::button_primary("Start node and connect to peers"),
                     )
                     .clicked()
                 {
                     start_run = true;
-                }
-                if ui
-                    .add_enabled(
-                        !busy && !running,
-                        theme::button_secondary("Start local miner"),
-                    )
-                    .clicked()
-                {
-                    start_mine = true;
                 }
             });
             ui.add_space(6.0);
@@ -1746,9 +1390,6 @@ impl GuiApp {
         if start_run {
             self.start_node(NodeKind::Run);
         }
-        if start_mine {
-            self.start_node(NodeKind::Mine);
-        }
         if pull_remote {
             self.pull_remote();
         }
@@ -1761,8 +1402,8 @@ impl GuiApp {
         page_header(
             ui,
             "WORKSPACE / SETTINGS",
-            "Local control, no key export",
-            "This wallet signs locally. Backups are encrypted. No seed phrase is ever displayed.",
+            "Wallet settings",
+            "Manage your saved wallet, password and encrypted backups.",
         );
         let busy = self.is_busy();
 
@@ -1980,7 +1621,7 @@ impl GuiApp {
 
         card(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(theme::section("HONEST LIMITATIONS"));
+                ui.label(theme::section("WALLET LIMITS"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .selectable_label(
@@ -1999,13 +1640,9 @@ impl GuiApp {
             });
             if self.show_limitations {
                 for line in [
-                    "This is pre-launch software. No genesis block exists and no launch parameters are final.",
-                    "There is no independent security audit or trusted pre-incident baseline for this source.",
-                    "The wallet is not a pool client and provides no share payout.",
-                    "Monario work/header/nonce formats are not established as Bitcoin Stratum V2 compatible.",
-                    "Peer discovery, pruning, remote RPC and a complete account-discovery UI are not implemented.",
-                    "Trusted checkpoints authenticate recovery; they are not finality checkpoints and do not prevent a heavier-chain reorg.",
-                    "Mining credits are policy units, not guaranteed income. Do not treat any local observation as a payout.",
+                    "Send selects transparent funds and supports transparent or private recipients.",
+                    "Balances reflect the last validated scan of the configured chain.",
+                    "Pool shares are tracked by the pool. Confirm payouts with the pool operator.",
                 ] {
                     ui.label(theme::caption(&format!("• {line}")));
                 }
@@ -2050,52 +1687,5 @@ fn render_json_summary(ui: &mut egui::Ui, value: &serde_json::Value) {
                 .desired_rows(5)
                 .desired_width(f32::INFINITY),
         );
-    }
-}
-
-fn render_service_status(ui: &mut egui::Ui, value: &serde_json::Value) {
-    let registered = value
-        .get("registered")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    ui.add_space(4.0);
-    if !registered {
-        ui.label(theme::caption("Not registered at the validated tip."));
-        return;
-    }
-    let Some(service) = value.get("service") else {
-        ui.label(theme::caption(
-            "Registration is present but no service record was returned.",
-        ));
-        return;
-    };
-    let pairs = [
-        ("registration_confirmations", "Confirmations"),
-        ("credited_seconds", "Proven seconds"),
-        ("required_seconds", "Required seconds"),
-        ("period_start", "Period start"),
-        ("deadline_height", "Proof deadline"),
-        ("penalty", "Penalty"),
-        ("operator_public_key", "Operator key"),
-    ];
-    for (key, label) in pairs {
-        if let Some(field) = service.get(key) {
-            let text = field
-                .as_str()
-                .map(str::to_owned)
-                .or_else(|| field.as_bool().map(|b| b.to_string()))
-                .or_else(|| field.as_u64().map(|n| n.to_string()))
-                .unwrap_or_else(|| field.to_string());
-            theme::key_value(ui, label, &GuiApp::short(&text));
-        }
-    }
-    for (key, label) in [
-        ("qualified", "Qualified"),
-        ("proof_due_next_block", "Proof due next block"),
-        ("banned", "Banned"),
-    ] {
-        if let Some(flag) = service.get(key).and_then(|v| v.as_bool()) {
-            theme::key_value(ui, label, if flag { "yes" } else { "no" });
-        }
     }
 }

@@ -42,7 +42,6 @@ pub struct PersistedState {
     pub remote_public_key: String,
     pub remote_max_blocks: u32,
     pub send_change_private: bool,
-    pub last_service_registration: String,
 }
 
 impl Default for PersistedState {
@@ -72,7 +71,6 @@ impl Default for PersistedState {
             remote_public_key: String::new(),
             remote_max_blocks: 1_000,
             send_change_private: false,
-            last_service_registration: String::new(),
         }
     }
 }

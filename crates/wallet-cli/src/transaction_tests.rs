@@ -227,6 +227,26 @@ fn payout_execute_plans_signs_and_publishes_one_reviewed_batch() {
 }
 
 #[test]
+fn input_scan_reports_a_tip_and_height_even_with_no_spendable_outputs() {
+    let dir = private_dir();
+    let source = DurableChain::open(
+        &dir.path().join("chain.sqlite"),
+        config(),
+        root(),
+        V6Verifier,
+        u64::MAX / 2,
+    )
+    .unwrap();
+    let store = wallet(dir.path());
+    let inputs = inventory(&store, &source);
+
+    assert_eq!(inputs["validated_tip"], hex(&source.chain().unwrap().tip()));
+    assert_eq!(inputs["height"], "0");
+    assert!(inputs["transparent"].as_array().unwrap().is_empty());
+    assert!(inputs["private"].as_array().unwrap().is_empty());
+}
+
+#[test]
 fn transparent_construction_verifies_and_reorg_retains_exact_signed_claims() {
     let dir = private_dir();
     let (mut source, mut model) = source(dir.path(), false);
@@ -237,6 +257,9 @@ fn transparent_construction_verifies_and_reorg_retains_exact_signed_claims() {
     assert_eq!(output["change_atoms"], "9");
     let bytes = verify(&source, &output);
     let inv = inventory(&store, &source);
+    let chain = source.chain().unwrap();
+    assert_eq!(inv["validated_tip"], hex(&chain.tip()));
+    assert_eq!(inv["height"], chain.height().to_string());
     assert!(
         inv["transparent"]
             .as_array()

@@ -260,12 +260,9 @@ pub(super) fn inputs(
         .values()
         .flat_map(|r| r.inputs.iter().copied())
         .collect();
-    let next = source
-        .chain()
-        .map_err(|_| Error::Scan)?
-        .height()
-        .checked_add(1)
-        .ok_or(Error::Scan)?;
+    let chain = source.chain().map_err(|_| Error::Scan)?;
+    let height = chain.height();
+    let next = height.checked_add(1).ok_or(Error::Scan)?;
     let maturity = source.coinbase_maturity().map_err(|_| Error::Scan)?;
     let transparent: Vec<_> = scanner.unspent_coins(source).map_err(|_| Error::Scan)?.iter()
         .filter(|(_, (owner,_))| *owner == account).map(|(p,(_,c))| serde_json::json!({
@@ -295,7 +292,7 @@ pub(super) fn inputs(
         .collect();
     Ok(
         serde_json::json!({ "checkpoint":receipt(store.checkpoint().map_err(storage)?,store.recovery_required().map_err(storage)?),
-        "account":account, "validation_profile":hex(&profile), "validated_tip":hex(&source.chain().map_err(|_| Error::Scan)?.tip()),
+        "account":account, "validation_profile":hex(&profile), "validated_tip":hex(&chain.tip()), "height":height.to_string(),
         "transparent":transparent, "private":private, "reservations":reservations }),
     )
 }

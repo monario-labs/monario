@@ -366,7 +366,7 @@ impl PoolMode {
     pub fn label(self) -> &'static str {
         match self {
             Self::Solo => "Solo (own node)",
-            Self::Official => "Official pool",
+            Self::Official => "Monario pool preset",
             Self::Custom => "Custom pool",
         }
     }

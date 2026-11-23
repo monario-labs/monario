@@ -3,8 +3,8 @@
 //! consensus code, creates genesis or starts a listener implicitly.
 use crate::backend::{
     self, BackendError, ChainSource, Coin, CommandSpec, ManagedNode, MiningConfig, Network,
-    NodeLaunch, NodeRef, NodeStatus, Payment, PaymentRequest, PoolMode, PoolSpec,
-    RegistrationIntent, StopOutcome, SubmitTarget, WalletRef,
+    NodeLaunch, NodeRef, NodeStatus, Payment, PaymentRequest, PoolMode, PoolSpec, StopOutcome,
+    SubmitTarget, WalletRef,
 };
 use crate::state::{self, PersistedState};
 use crate::theme::{self, *};
@@ -25,7 +25,6 @@ pub enum Page {
     Overview,
     Send,
     Receive,
-    Smartnode,
     Mining,
     Node,
     Settings,
@@ -53,12 +52,6 @@ pub enum OpenMode {
 pub enum NodeKind {
     Run,
     Mine,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ControlUi {
-    Rotation,
-    Reactivation,
 }
 
 #[derive(Clone, Debug)]
@@ -135,23 +128,6 @@ impl ConstructView {
 }
 
 #[derive(Clone, Debug)]
-pub struct OperatorKey {
-    pub address: String,
-    pub public_key: String,
-    pub index: u32,
-}
-
-impl OperatorKey {
-    fn parse(value: &serde_json::Value) -> Option<Self> {
-        Some(Self {
-            address: value.get("address")?.as_str()?.to_owned(),
-            public_key: value.get("operator_public_key")?.as_str()?.to_owned(),
-            index: value.get("index")?.as_str()?.parse().ok()?,
-        })
-    }
-}
-
-#[derive(Clone, Debug)]
 pub struct AddressView {
     pub address: String,
     pub kind: &'static str,
@@ -196,14 +172,9 @@ enum JobTag {
     Discover,
     FeeEstimate,
     Construct,
-    ServiceConstruct,
     Export,
     TransactionStatus,
     Submit,
-    ServiceKey,
-    ServiceStatus,
-    ServiceAuthorize,
-    ServiceStep,
     NodeCreate,
     NodeInfo,
     InboxCreate,
@@ -265,10 +236,10 @@ pub struct GuiApp {
     pub(crate) balance: Option<BalanceView>,
     pub(crate) coins: Vec<Coin>,
     pub(crate) inputs_tip: String,
+    pub(crate) inputs_height: Option<u64>,
     pub(crate) addresses: Vec<AddressView>,
     pub(crate) pending_request: Option<PathBuf>,
     pub(crate) send_coins: BTreeSet<(String, u32)>,
-    pub(crate) service_coins: BTreeSet<(String, u32)>,
     pub(crate) send_address: String,
     pub(crate) send_amount: String,
     pub(crate) send_fee: String,
@@ -279,22 +250,6 @@ pub struct GuiApp {
     pub(crate) exported_hex: String,
     pub(crate) last_status: Option<serde_json::Value>,
     pub(crate) remote_result: Option<serde_json::Value>,
-
-    // Smartnode
-    pub(crate) operator_key: Option<OperatorKey>,
-    pub(crate) owner_index: String,
-    pub(crate) collateral: Option<(String, u32)>,
-    pub(crate) service_fee: String,
-    pub(crate) service_max_fee: String,
-    pub(crate) service_expiry: String,
-    pub(crate) service_construct: Option<ConstructView>,
-    pub(crate) service_registration: String,
-    pub(crate) service_status: Option<serde_json::Value>,
-    pub(crate) schedule_fee: String,
-    pub(crate) schedule_budget: String,
-    pub(crate) control_purpose: ControlUi,
-    pub(crate) control_index: String,
-    pub(crate) authorization: String,
 
     // Node runtime
     pub(crate) node: Option<ManagedNode>,
@@ -361,10 +316,10 @@ impl GuiApp {
             balance: None,
             coins: Vec::new(),
             inputs_tip: String::new(),
+            inputs_height: None,
             addresses: Vec::new(),
             pending_request: None,
             send_coins: BTreeSet::new(),
-            service_coins: BTreeSet::new(),
             send_address: String::new(),
             send_amount: String::new(),
             send_fee: "0.001".into(),
@@ -375,20 +330,6 @@ impl GuiApp {
             exported_hex: String::new(),
             last_status: None,
             remote_result: None,
-            operator_key: None,
-            owner_index: "0".into(),
-            collateral: None,
-            service_fee: "0.001".into(),
-            service_max_fee: "0.01".into(),
-            service_expiry: "20".into(),
-            service_construct: None,
-            service_registration: String::new(),
-            service_status: None,
-            schedule_fee: "0.001".into(),
-            schedule_budget: "1".into(),
-            control_purpose: ControlUi::Rotation,
-            control_index: "0".into(),
-            authorization: String::new(),
             node: None,
             node_kind: None,
             node_status: None,
@@ -445,7 +386,6 @@ impl GuiApp {
                 app.node_profile.trim()
             );
         }
-        app.service_registration = app.state.last_service_registration.clone();
         app
     }
 
@@ -546,10 +486,6 @@ impl GuiApp {
             .unwrap_or_else(|| "No wallet".into())
     }
 
-    pub(crate) fn height(&self) -> Option<u64> {
-        self.balance.as_ref().map(|balance| balance.height)
-    }
-
     pub(crate) fn selected_coins<'a>(
         &self,
         coins: &'a [Coin],
@@ -578,7 +514,6 @@ impl GuiApp {
         self.confirm.clear();
         self.unlocked = false;
         self.construct = None;
-        self.service_construct = None;
         self.info("Wallet locked. Secrets were cleared from memory.");
     }
 
@@ -712,7 +647,7 @@ impl GuiApp {
         self.spawn(JobTag::Balance, spec);
     }
 
-    pub(crate) fn load_coins(&mut self) {
+    pub(crate) fn refresh_spendable_outputs(&mut self) {
         let (wallet, source, secret) = match (self.wallet(), self.source(), self.secret()) {
             (Ok(wallet), Ok(source), Ok(secret)) => (wallet, source, secret),
             (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
@@ -721,10 +656,11 @@ impl GuiApp {
             }
         };
         let inputs = backend::wallet_inputs(&wallet, &source, &secret);
-        self.last_action = "Loading spendable coins".into();
+        self.inputs_tip.clear();
+        self.inputs_height = None;
+        self.coins.clear();
+        self.last_action = "Scanning wallet outputs".into();
         self.spawn(JobTag::Inputs, inputs);
-        let balance = backend::wallet_balance(&wallet, &source, &secret);
-        self.spawn(JobTag::Balance, balance);
     }
 
     pub(crate) fn new_address(&mut self, kind: backend::AddressKind) {
@@ -758,12 +694,12 @@ impl GuiApp {
             self.error("confirm that signing reserves the selected inputs");
             return;
         }
-        let Some(height) = self.height() else {
-            self.error("refresh the balance before building a transaction");
+        let Some(height) = self.inputs_height else {
+            self.error("scan for spendable outputs before building a transaction");
             return;
         };
         if self.inputs_tip.is_empty() || self.coins.is_empty() {
-            self.error("load coins and confirm the validated tip first");
+            self.error("scan for spendable outputs before building a transaction");
             return;
         }
         let address = self.send_address.trim().to_owned();
@@ -1022,283 +958,6 @@ impl GuiApp {
         );
         self.last_action = "Estimating a fee from validated blocks".into();
         self.spawn(JobTag::FeeEstimate, spec);
-    }
-
-    pub(crate) fn reserve_operator_key(&mut self) {
-        let (wallet, secret) = match (self.wallet(), self.secret()) {
-            (Ok(wallet), Ok(secret)) => (wallet, secret),
-            (Err(error), _) | (_, Err(error)) => {
-                self.error(error);
-                return;
-            }
-        };
-        let spec = backend::wallet_service_key(&wallet, self.state.source.account, &secret);
-        self.last_action = "Reserving an operator key".into();
-        self.spawn(JobTag::ServiceKey, spec);
-    }
-
-    pub(crate) fn construct_registration(&mut self) {
-        let (wallet, source, secret) = match (self.wallet(), self.source(), self.secret()) {
-            (Ok(wallet), Ok(source), Ok(secret)) => (wallet, source, secret),
-            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
-                self.error(error);
-                return;
-            }
-        };
-        let Some(operator) = self.operator_key.clone() else {
-            self.error("reserve the operator key first");
-            return;
-        };
-        let Some((collateral_tx, collateral_index)) = self.collateral.clone() else {
-            self.error("select the 1000 MONAR collateral coin");
-            return;
-        };
-        let Some(height) = self.height() else {
-            self.error("refresh the balance before registering");
-            return;
-        };
-        let owner_index = match backend::parse_u64(self.owner_index.trim(), "owner index") {
-            Ok(value) => u32::try_from(value).unwrap_or(u32::MAX),
-            Err(error) => {
-                self.error(error.to_string());
-                return;
-            }
-        };
-        let fee = match backend::parse_monar(&self.service_fee) {
-            Ok(value) => value,
-            Err(error) => {
-                self.error(error.to_string());
-                return;
-            }
-        };
-        let max_fee = match backend::parse_monar(&self.service_max_fee) {
-            Ok(value) => value,
-            Err(error) => {
-                self.error(error.to_string());
-                return;
-            }
-        };
-        let delta = match backend::parse_u64(self.service_expiry.trim(), "expiry delta") {
-            Ok(value) if value > 0 && value <= 10_000 => value,
-            _ => {
-                self.error("expiry delta must be between 1 and 10,000 blocks");
-                return;
-            }
-        };
-        let intent = RegistrationIntent {
-            collateral_transaction: collateral_tx.clone(),
-            collateral_index,
-            owner_index,
-            operator_public_key: operator.public_key.clone(),
-        };
-        let funding: Vec<backend::OutPoint> = self
-            .selected_coins(&self.coins, &self.service_coins)
-            .into_iter()
-            .filter(|coin| !(coin.transaction == collateral_tx && coin.index == collateral_index))
-            .map(|coin| backend::OutPoint {
-                transaction: coin.transaction.clone(),
-                index: coin.index,
-            })
-            .collect();
-        let available: u64 = self
-            .selected_coins(&self.coins, &self.service_coins)
-            .iter()
-            .filter(|coin| !(coin.transaction == collateral_tx && coin.index == collateral_index))
-            .map(|coin| coin.atoms)
-            .sum();
-        if available < fee {
-            self.error("the selected fee coins do not cover the registration fee");
-            return;
-        }
-        if self.inputs_tip.is_empty() {
-            self.error("reload coins to bind the current validated tip");
-            return;
-        }
-        let expiry = height.saturating_add(delta);
-        let request = PaymentRequest {
-            validated_tip: self.inputs_tip.clone(),
-            funding,
-            payments: Vec::new(),
-            fee_atoms: fee,
-            expiry_height: expiry,
-            change: backend::AddressKind::Transparent,
-            service: Some(intent.json()),
-        };
-        let encoded = match request.to_json() {
-            Ok(encoded) => encoded,
-            Err(error) => {
-                self.error(error.to_string());
-                return;
-            }
-        };
-        let name = self.next_request_name("registration");
-        let path = match state::write_request_file(
-            std::path::Path::new(&wallet.directory),
-            &name,
-            &encoded,
-        ) {
-            Ok(path) => path,
-            Err(error) => {
-                self.error(error);
-                return;
-            }
-        };
-        let spec = backend::wallet_construct(&wallet, &source, &name, max_fee, &secret);
-        self.pending_request = Some(path);
-        self.last_action = "Building the registration transaction".into();
-        self.spawn(JobTag::ServiceConstruct, spec);
-    }
-
-    pub(crate) fn submit_registration(&mut self) {
-        let Some(construct) = self.service_construct.clone() else {
-            self.error("build the registration first");
-            return;
-        };
-        let (wallet, target, secret) = match (self.wallet(), self.target(), self.secret()) {
-            (Ok(wallet), Ok(target), Ok(secret)) => (wallet, target, secret),
-            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
-                self.error(error);
-                return;
-            }
-        };
-        let spec = backend::wallet_submit(
-            &wallet,
-            &target,
-            &construct.profile,
-            &construct.reservation,
-            &secret,
-        );
-        self.last_action = "Queueing the registration transaction".into();
-        self.spawn(JobTag::Submit, spec);
-    }
-
-    pub(crate) fn check_service_status(&mut self) {
-        let registration = self.service_registration.trim().to_owned();
-        let (wallet, source, secret) = match (self.wallet(), self.source(), self.secret()) {
-            (Ok(wallet), Ok(source), Ok(secret)) => (wallet, source, secret),
-            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
-                self.error(error);
-                return;
-            }
-        };
-        if backend::validate_hex(&registration, 32, "registration id").is_err() {
-            self.error("enter the 32-byte registration transaction id");
-            return;
-        }
-        let spec = backend::wallet_service_status(&wallet, &source, &registration, &secret);
-        self.last_action = "Reading validated service state".into();
-        self.spawn(JobTag::ServiceStatus, spec);
-    }
-
-    pub(crate) fn run_service_step(&mut self) {
-        let (wallet, source, target, secret) =
-            match (self.wallet(), self.source(), self.target(), self.secret()) {
-                (Ok(wallet), Ok(source), Ok(target), Ok(secret)) => {
-                    (wallet, source, target, secret)
-                }
-                (Err(error), _, _, _)
-                | (_, Err(error), _, _)
-                | (_, _, Err(error), _)
-                | (_, _, _, Err(error)) => {
-                    self.error(error);
-                    return;
-                }
-            };
-        let registration = self.service_registration.trim().to_owned();
-        if backend::validate_hex(&registration, 32, "registration id").is_err() {
-            self.error("enter the 32-byte registration transaction id");
-            return;
-        }
-        let operator_index = match backend::parse_u64(self.owner_index.trim(), "operator index") {
-            Ok(value) => u32::try_from(value).unwrap_or(u32::MAX),
-            Err(error) => {
-                self.error(error.to_string());
-                return;
-            }
-        };
-        let fee = match backend::parse_monar(&self.schedule_fee) {
-            Ok(value) => value,
-            Err(error) => {
-                self.error(error.to_string());
-                return;
-            }
-        };
-        let budget = match backend::parse_monar(&self.schedule_budget) {
-            Ok(value) => value,
-            Err(error) => {
-                self.error(error.to_string());
-                return;
-            }
-        };
-        let fee_inputs: Vec<backend::OutPoint> = self
-            .selected_coins(&self.coins, &self.service_coins)
-            .into_iter()
-            .map(|coin| backend::OutPoint {
-                transaction: coin.transaction.clone(),
-                index: coin.index,
-            })
-            .collect();
-        let encoded = match backend::proof_schedule_json(
-            &registration,
-            operator_index,
-            fee,
-            budget,
-            &fee_inputs,
-        ) {
-            Ok(encoded) => encoded,
-            Err(error) => {
-                self.error(error.to_string());
-                return;
-            }
-        };
-        let name = self.next_request_name("schedule");
-        let path = match state::write_request_file(
-            std::path::Path::new(&wallet.directory),
-            &name,
-            &encoded,
-        ) {
-            Ok(path) => path,
-            Err(error) => {
-                self.error(error);
-                return;
-            }
-        };
-        let spec = backend::wallet_service_step(&wallet, &source, &name, fee, &target, &secret);
-        self.pending_request = Some(path);
-        self.last_action = "Running one bounded proof step".into();
-        self.spawn(JobTag::ServiceStep, spec);
-    }
-
-    pub(crate) fn authorize_operator(&mut self) {
-        let (wallet, source, secret) = match (self.wallet(), self.source(), self.secret()) {
-            (Ok(wallet), Ok(source), Ok(secret)) => (wallet, source, secret),
-            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
-                self.error(error);
-                return;
-            }
-        };
-        let registration = self.service_registration.trim().to_owned();
-        let index = match backend::parse_u64(self.control_index.trim(), "operator index") {
-            Ok(value) => u32::try_from(value).unwrap_or(u32::MAX),
-            Err(error) => {
-                self.error(error.to_string());
-                return;
-            }
-        };
-        let purpose = match self.control_purpose {
-            ControlUi::Rotation => backend::ControlPurpose::Rotation,
-            ControlUi::Reactivation => backend::ControlPurpose::Reactivation,
-        };
-        let spec = backend::wallet_service_authorize(
-            &wallet,
-            &source,
-            &registration,
-            purpose,
-            index,
-            &secret,
-        );
-        self.last_action = "Exporting a public authorization".into();
-        self.spawn(JobTag::ServiceAuthorize, spec);
     }
 
     pub(crate) fn create_node_identity(&mut self) {
@@ -1625,12 +1284,11 @@ impl GuiApp {
             self.balance = None;
             self.coins.clear();
             self.inputs_tip.clear();
+            self.inputs_height = None;
             self.addresses.clear();
             self.send_coins.clear();
-            self.service_coins.clear();
             self.pending_request = None;
             self.construct = None;
-            self.service_construct = None;
             self.exported_hex.clear();
             self.last_status = None;
             self.confirm_reserve = false;
@@ -1764,23 +1422,32 @@ impl GuiApp {
                 None => self.error("the balance receipt was not understood"),
             },
             JobTag::Inputs => {
+                let tip = value["validated_tip"]
+                    .as_str()
+                    .filter(|tip| backend::validate_hex(tip, 32, "validated tip").is_ok());
+                let height = backend::field_u64(&value, "height");
+                let (Some(tip), Some(height)) = (tip, height) else {
+                    self.error("the wallet output scan receipt was not understood");
+                    return;
+                };
+                if value["validation_profile"].as_str() != Some(self.state.source.profile.trim())
+                    || value["account"].as_u64() != Some(u64::from(self.state.source.account))
+                {
+                    self.error("the chain source changed during scanning. Scan again.");
+                    return;
+                }
                 self.coins = backend::parse_coins(&value);
-                self.inputs_tip = value
-                    .get("validated_tip")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_owned();
+                self.inputs_tip = tip.to_owned();
+                self.inputs_height = Some(height);
                 let valid: BTreeSet<_> = self
                     .coins
                     .iter()
+                    .filter(|coin| coin.selectable())
                     .map(|coin| (coin.transaction.clone(), coin.index))
                     .collect();
                 self.send_coins.retain(|key| valid.contains(key));
-                self.service_coins.retain(|key| valid.contains(key));
-                self.success(format!(
-                    "Loaded {} unspent transparent coins.",
-                    self.coins.len()
-                ));
+                let spendable = self.coins.iter().filter(|coin| coin.selectable()).count();
+                self.success(format!("Scan complete. {spendable} spendable outputs."));
             }
             JobTag::Discover => {
                 self.discovery_result = Some(value);
@@ -1808,7 +1475,7 @@ impl GuiApp {
                     );
                 }
             }
-            JobTag::Construct | JobTag::ServiceConstruct => {
+            JobTag::Construct => {
                 if let Some(path) = self.pending_request.take() {
                     let _ = std::fs::remove_file(path);
                 }
@@ -1816,21 +1483,9 @@ impl GuiApp {
                     self.error("the transaction receipt was not understood");
                     return;
                 };
-                if tag == JobTag::ServiceConstruct {
-                    self.service_registration = construct.transaction_id.clone();
-                    self.state.last_service_registration = self.service_registration.clone();
-                    self.service_construct = Some(construct);
-                    self.success(
-                        "Registration built. Inputs are reserved; review before submitting.",
-                    );
-                    self.persist();
-                } else {
-                    self.construct = Some(construct);
-                    self.confirm_reserve = false;
-                    self.success(
-                        "Transaction signed. Inputs are reserved; review before submitting.",
-                    );
-                }
+                self.construct = Some(construct);
+                self.confirm_reserve = false;
+                self.success("Transaction signed. Inputs are reserved; review before submitting.");
             }
             JobTag::Export => {
                 self.exported_hex = value
@@ -1847,33 +1502,6 @@ impl GuiApp {
             JobTag::Submit => {
                 self.last_status = Some(value);
                 self.success("Signed transaction queued in the pinned inbox.");
-            }
-            JobTag::ServiceKey => match OperatorKey::parse(&value) {
-                Some(key) => {
-                    self.operator_key = Some(key);
-                    self.success("Operator key reserved. The secret never leaves the wallet.");
-                }
-                None => self.error("the operator key receipt was not understood"),
-            },
-            JobTag::ServiceStatus => {
-                self.service_status = Some(value);
-                self.success("Service state refreshed.");
-            }
-            JobTag::ServiceAuthorize => {
-                self.authorization = value
-                    .get("authorization")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_owned();
-                self.last_status = Some(value);
-                self.success("Public authorization exported.");
-            }
-            JobTag::ServiceStep => {
-                if let Some(path) = self.pending_request.take() {
-                    let _ = std::fs::remove_file(path);
-                }
-                self.last_status = Some(value);
-                self.success("One bounded proof step completed.");
             }
             JobTag::NodeCreate => {
                 let profile = value
@@ -2114,11 +1742,7 @@ impl GuiApp {
                 }
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.add_space(6.0);
-                    ui.label(theme::caption(&format!("v{APP_VERSION} · PRE-LAUNCH")));
-                    ui.add_space(2.0);
-                    ui.label(theme::caption("No genesis. No implicit network."));
-                    ui.add_space(10.0);
-                    ui.label(theme::caption("Local keys never leave this machine."));
+                    ui.label(theme::caption(&format!("v{APP_VERSION}")));
                     ui.add_space(14.0);
                     if self.unlocked {
                         ui.label(theme::mono(&Self::short(&self.wallet_label())));
@@ -2368,7 +1992,6 @@ impl eframe::App for GuiApp {
                                 Page::Overview => self.overview(ui),
                                 Page::Send => self.send(ui),
                                 Page::Receive => self.receive(ui),
-                                Page::Smartnode => self.smartnode(ui),
                                 Page::Mining => self.mining(ui),
                                 Page::Node => self.node(ui),
                                 Page::Settings => self.settings(ui),
@@ -2381,4 +2004,91 @@ impl eframe::App for GuiApp {
 
 pub(crate) fn atom_text(atoms: u64) -> String {
     format!("{} MONAR", backend::format_monar(atoms))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn labels(render: impl FnOnce(&mut GuiApp, &mut egui::Ui)) -> Vec<String> {
+        fn collect(shape: &egui::Shape, labels: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => labels.push(text.galley.job.text.clone()),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, labels);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut app = GuiApp::from_state(PersistedState::default());
+        let mut render = Some(render);
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                if let Some(render) = render.take() {
+                    render(&mut app, ui);
+                }
+            });
+        });
+        let mut labels = Vec::new();
+        for shape in output.shapes {
+            collect(&shape.shape, &mut labels);
+        }
+        labels
+    }
+
+    #[test]
+    fn unconfigured_wallet_points_to_setup_before_scanning() {
+        let overview = labels(GuiApp::overview);
+        assert!(
+            overview
+                .iter()
+                .any(|label| label == "Set up balance scanning")
+        );
+        assert!(
+            !overview
+                .iter()
+                .any(|label| label == "Refresh balance" || label == "Load coins")
+        );
+
+        let send = labels(GuiApp::send);
+        assert!(send.iter().any(|label| label == "Set up chain source"));
+        assert!(
+            !send
+                .iter()
+                .any(|label| label == "Scan for spendable outputs")
+        );
+    }
+
+    #[test]
+    fn configured_wallet_keeps_balance_and_spend_scans_separate() {
+        let overview = labels(|app, ui| {
+            configure_scan_source(app);
+            app.overview(ui);
+        });
+        assert!(overview.iter().any(|label| label == "Refresh balance"));
+        assert!(
+            !overview
+                .iter()
+                .any(|label| label == "Scan for spendable outputs")
+        );
+
+        let send = labels(|app, ui| {
+            configure_scan_source(app);
+            app.send(ui);
+        });
+        assert!(
+            send.iter()
+                .any(|label| label == "Scan for spendable outputs")
+        );
+    }
+
+    fn configure_scan_source(app: &mut GuiApp) {
+        app.state.source.directory = "chain".into();
+        app.state.source.manifest = "node.json".into();
+        app.state.source.profile = "ab".repeat(32);
+    }
 }
