@@ -77,7 +77,7 @@ jobs:
           $privateTerms = Join-Path $stage 'private-terms'
           [System.IO.File]::WriteAllLines($privateTerms, [string[]]$privateValues)
 
-          Invoke-Native @('git', '-C', $env:GITHUB_WORKSPACE, 'archive', '-o', $archive, 'HEAD', 'Cargo.toml', 'Cargo.lock', 'crates', 'src', 'tests', 'vendor', 'launch/testnet', 'launch/bootstrap', 'docs/desktop-release.md', 'website/assets/monario-mark.png', 'tools/build_private.py', 'tools/package_desktop.py', 'tools/verify_vendor.py')
+          Invoke-Native @('git', '-c', 'core.autocrlf=false', '-C', $env:GITHUB_WORKSPACE, 'archive', '-o', $archive, 'HEAD', 'Cargo.toml', 'Cargo.lock', 'crates', 'src', 'tests', 'vendor', 'launch/testnet', 'launch/bootstrap', 'docs/desktop-release.md', 'website/assets/monario-mark.png', 'tools/build_private.py', 'tools/package_desktop.py', 'tools/verify_vendor.py')
           Invoke-Native @('tar', '-xf', $archive, '-C', $source)
 
           $py = if ($IsWindows) { 'python' } else { 'python3' }
