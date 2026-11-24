@@ -1,0 +1,98 @@
+name: stage testnet draft macos
+
+on:
+  push:
+    branches:
+      - ci/testnet-draft-assets
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  stage:
+    if: github.repository == 'monario-labs/monario'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Stage draft macOS assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          REPO="monario-labs/monario"
+          RELEASE_ID="457190869"
+          RELEASE_API="repos/${REPO}/releases/${RELEASE_ID}"
+          UPLOAD_API="https://uploads.github.com/repos/${REPO}/releases/${RELEASE_ID}/assets"
+          TARGET_COMMIT="d66f71b50f50363f5461ae4bbafb2fe7ada980d8"
+          RUN_ID="45403926541"
+
+          WORK="$(mktemp -d)"
+          trap 'rm -rf "$WORK"' EXIT
+          umask 077
+          AUTH_HEADER="$WORK/auth.hdr"
+          printf 'Authorization: Bearer %s\n' "$GH_TOKEN" > "$AUTH_HEADER"
+
+          fail() {
+            echo "::error::$1" >&2
+            exit 1
+          }
+
+          check_release() {
+            local state
+            state="$(gh api "$RELEASE_API" --jq '[(.draft | tostring), (.prerelease | tostring), ((.published_at == null) | tostring), .target_commitish] | join(" ")')"
+            [ "$state" = "true true true $TARGET_COMMIT" ] || fail "Release state mismatch: $state"
+          }
+
+          stage_asset() {
+            local artifact="$1"
+            local name="$2"
+            local expected="$3"
+            local dir="$WORK/$artifact"
+            local found=()
+            local file actual existing response digest_line
+
+            mkdir -p "$dir"
+            gh run download "$RUN_ID" --repo "$REPO" --name "$artifact" --dir "$dir"
+
+            mapfile -t found < <(find "$dir" -type f -name "$name")
+            [ "${#found[@]}" -eq 1 ] || fail "Expected exactly one $name in $artifact, found ${#found[@]}"
+            file="${found[0]}"
+
+            actual="$(sha256sum "$file" | awk '{print $1}')"
+            [ "$actual" = "$expected" ] || fail "SHA256 mismatch for $name"
+
+            existing="$(gh api "repos/${REPO}/releases/${RELEASE_ID}/assets" --paginate --jq ".[] | select(.name == \"$name\") | .digest")"
+            if [ -n "$existing" ]; then
+              while IFS= read -r digest_line; do
+                [ "$digest_line" = "sha256:$expected" ] || fail "Existing asset $name has a different digest; refusing to replace"
+              done <<< "$existing"
+              echo "$name already present with matching digest; skipping upload"
+              return 0
+            fi
+
+            response="$WORK/$name.json"
+            curl -fsS --max-time 65 -X POST \
+              -H @"$AUTH_HEADER" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/zip" \
+              --data-binary @"$file" \
+              "${UPLOAD_API}?name=${name}" \
+              -o "$response"
+
+            jq -e --arg n "$name" --arg d "sha256:$expected" \
+              '.name == $n and .state == "uploaded" and .digest == $d' "$response" >/dev/null \
+              || fail "Upload response validation failed for $name"
+
+            echo "Uploaded $name"
+          }
+
+          check_release
+
+          stage_asset "testnet-wallet-preview-macos-x86_64" "monario-testnet-desktop-macos-x86_64.zip" "48cbf62b8c5cfab2e1e0599e8d2c0ba70d81d96792113dc89eaf3578ad65d835"
+          stage_asset "testnet-wallet-preview-macos-arm64" "monario-testnet-desktop-macos-arm64.zip" "94e3d6bf8240373ca376c7d6f4afc10d0e3afd7595b2998594be6c4903b09fae"
+
+          check_release
+          echo "Draft release unchanged after upload"
