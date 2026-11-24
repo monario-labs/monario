@@ -24,7 +24,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: windows-2025
+          - runner: windows-2022
             slug: windows-x86_64
             host: x86_64-pc-windows-msvc
             arch: X64
