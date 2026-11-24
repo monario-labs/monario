@@ -1,6 +1,8 @@
 //! Explicit TCP pool server/client drivers. Construction opens no socket; only
 //! `run`/`connect` activate networking. Tests only exercise pre-stopped paths.
-use super::session::{self, Client, ClientPolicy, Event, Limits, RandomXFactory, Server};
+use super::session::{
+    self, CheckerFactory, Client, ClientPolicy, Event, Limits, RandomXFactory, Server,
+};
 use super::{Error as PoolError, Policy, ledger, link, wire};
 use crate::{
     Clock, Node,
@@ -40,6 +42,32 @@ const MAX_POLL_MS: u64 = 60_000;
 const MAX_TIMESTAMP_SECONDS: u32 = 3_600;
 const MAX_CONNECT_TIMEOUT_MS: u64 = 30_000;
 
+/// Client-side connection lifecycle. A transport connection is not an
+/// authenticated session, and a rejected credential is not a later share
+/// rejection. No phase carries any secret.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Phase {
+    #[default]
+    Offline,
+    Handshake,
+    Authenticating,
+    Authenticated,
+    Rejected,
+}
+
+impl Phase {
+    /// Fixed lowercase label for the public status snapshot.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Offline => "offline",
+            Self::Handshake => "handshake",
+            Self::Authenticating => "authenticating",
+            Self::Authenticated => "authenticated",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
 pub struct ServerConfig {
     pub identity: Identity,
     pub listen: SocketAddr,
@@ -62,6 +90,7 @@ pub struct TcpPool {
     base_ms: u64,
     connections: Vec<Connection>,
     current: Option<Arc<Work>>,
+    factory: Arc<dyn CheckerFactory>,
 }
 
 impl TcpPool {
@@ -78,6 +107,7 @@ impl TcpPool {
         {
             return Err(Error::Configuration);
         }
+        let factory: Arc<dyn CheckerFactory> = Arc::new(RandomXFactory::new(config.mode));
         Ok(Self {
             config,
             timestamp: None,
@@ -87,6 +117,7 @@ impl TcpPool {
             base_ms: 0,
             connections: Vec::new(),
             current: None,
+            factory,
         })
     }
 
@@ -187,14 +218,14 @@ impl TcpPool {
             }
             let work = self.current.as_ref().ok_or(Error::NoWork)?.clone();
             for connection in &mut self.connections {
-                if connection
+                match connection
                     .server
-                    .replace_work(work.as_ref(), clock.monotonic_ms)
-                    .is_err()
+                    .apply_work(work.as_ref(), clock.monotonic_ms)
                 {
-                    connection.link.close();
+                    Ok(true) => connection.sent_job = None,
+                    Ok(false) => {}
+                    Err(_) => connection.link.close(),
                 }
-                connection.sent_job = None;
             }
             self.connections
                 .retain(|connection| !connection.link.is_closed());
@@ -229,9 +260,7 @@ impl TcpPool {
                         work.as_ref(),
                         self.config.policy,
                         self.config.clients.clone(),
-                        Box::new(RandomXFactory {
-                            mode: self.config.mode,
-                        }),
+                        self.factory.clone(),
                         self.config.limits,
                     )
                     .map_err(Error::Session)?;
@@ -310,6 +339,18 @@ struct Connection {
     sent_job: Option<[u8; 32]>,
 }
 
+/// A reply that leaves the peer without a usable current assignment, so the
+/// driver must dispatch the live job again. `AuthOk` starts a fresh session;
+/// `STALE` means the peer just discarded an assignment (possibly a replacement
+/// it had already received), and `job_at` still gates the resend by expiry, so
+/// retired or expired work is never revived.
+fn needs_dispatch(reply: &wire::Message) -> bool {
+    matches!(
+        reply,
+        wire::Message::AuthOk { .. } | wire::Message::Rejected { code: wire::STALE }
+    )
+}
+
 impl Connection {
     fn tick(
         &mut self,
@@ -325,13 +366,16 @@ impl Connection {
                 .handle(node, ledger, message, bytes, clock)
                 .map_err(Error::Session)?;
             self.link.send(&reply).map_err(Error::Link)?;
-            if matches!(reply, wire::Message::AuthOk { .. }) {
+            if needs_dispatch(&reply) {
+                // Redispatch at most one current unexpired job below, after this
+                // rejection, so a late old-assignment Submit cannot leave the
+                // client without work until lease expiry.
                 self.sent_job = None;
             }
         }
         if self.server.is_authenticated()
             && self.sent_job.is_none()
-            && let Some(job) = self.server.job()
+            && let Some(job) = self.server.job_at(clock.monotonic_ms)
         {
             let id = match &job {
                 wire::Message::Job { job, .. } => *job,
@@ -426,12 +470,16 @@ impl TcpClient {
         let mut events = Vec::new();
         for message in messages {
             let bytes = wire::encode(&message).map_err(Error::Wire)?.len();
-            events.push(
-                state
-                    .client
-                    .handle(node, message, bytes, clock)
-                    .map_err(Error::Session)?,
-            );
+            let event = state
+                .client
+                .handle(node, message, bytes, clock)
+                .map_err(Error::Session)?;
+            events.push(event);
+            // A credential rejection is terminal: later frames must not be
+            // processed against the rejected session.
+            if state.client.auth_rejected() {
+                break;
+            }
         }
         state.link.flush(clock.monotonic_ms).map_err(Error::Link)?;
         if state.client.is_closed() {
@@ -458,6 +506,29 @@ impl TcpClient {
         self.state
             .as_ref()
             .is_some_and(|state| !state.link.is_closed())
+    }
+
+    /// Distinguish an open transport/handshake from a usable authenticated
+    /// session and from a credential the server explicitly rejected.
+    pub fn phase(&self) -> Phase {
+        let Some(state) = self.state.as_ref() else {
+            return Phase::Offline;
+        };
+        // A peer may close immediately after rejecting the credential. Keep the
+        // explicit rejection visible instead of degrading to "offline".
+        if state.client.auth_rejected() {
+            return Phase::Rejected;
+        }
+        if state.link.is_closed() {
+            return Phase::Offline;
+        }
+        if state.client.is_authenticated() {
+            Phase::Authenticated
+        } else if state.link.is_established() {
+            Phase::Authenticating
+        } else {
+            Phase::Handshake
+        }
     }
 
     pub fn close(&mut self) {
@@ -530,6 +601,7 @@ mod tests {
         })
         .unwrap();
         assert!(!client.is_connected());
+        assert_eq!(client.phase(), Phase::Offline);
         assert!(client.tick(&n, clock(10)).is_err());
         let mut manager = Manager::new(address(), Network::Regtest, vec![]);
         let stop = AtomicBool::new(true);
@@ -537,6 +609,52 @@ mod tests {
         pool.run(&mut n, &mut manager, &mut ledger, &stop).unwrap();
         assert_eq!(n.peer_count(), 0);
         assert_eq!(ledger.share_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn stale_and_auth_ok_redispatch_but_busy_and_invalid_do_not() {
+        assert!(needs_dispatch(&wire::Message::AuthOk { session: [1; 16] }));
+        assert!(needs_dispatch(&wire::Message::Rejected { code: wire::STALE }));
+        for code in [wire::BUSY, wire::INVALID, wire::DUPLICATE, wire::QUOTA] {
+            assert!(!needs_dispatch(&wire::Message::Rejected { code }));
+        }
+        assert!(!needs_dispatch(&wire::Message::Accepted {
+            units: 1,
+            block_candidate: false,
+        }));
+        assert!(!needs_dispatch(&wire::Message::Job {
+            assignment: [1; 32],
+            parent: [2; 32],
+            job: [3; 32],
+            prefix: [4; 24],
+            start: 0,
+            end: 1,
+            target: [5; 32],
+            packet: vec![],
+        }));
+    }
+
+    #[test]
+    fn phase_labels_are_fixed_and_ordered() {
+        assert_eq!(Phase::default(), Phase::Offline);
+        let labels = [
+            Phase::Offline,
+            Phase::Handshake,
+            Phase::Authenticating,
+            Phase::Authenticated,
+            Phase::Rejected,
+        ]
+        .map(Phase::label);
+        assert_eq!(
+            labels,
+            [
+                "offline",
+                "handshake",
+                "authenticating",
+                "authenticated",
+                "rejected"
+            ]
+        );
     }
 
     #[test]

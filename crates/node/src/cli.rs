@@ -23,8 +23,9 @@ pub fn verify_bootstrap_bundle(
 use crate::{
     Limits, Node,
     mining::operator::{
-        Config as OperatorConfig, OFFICIAL_POOL_ADDRESS, Operator, PoolOperator,
+        Config as OperatorConfig, Operator, PoolOperator,
         PoolOperatorConfig, PoolStatus, Status as OperatorStatus,
+        validate_solo_address,
     },
     transport::Identity,
     transport::persistent::{Checkpoint, IdentityDirectory, IdentityStore, Password, TrustedPeers},
@@ -60,7 +61,7 @@ pub const STATE_CHECKPOINT_LIMITS: SnapshotLimits = SnapshotLimits {
 
 pub const HELP: &str = "Monario node CLI (no launch defaults)\n\nCommands: identity-create, identity-info, peers-set, password-change, submission-create, submission-forget, submission-rotate, checkpoint-create, checkpoint-prune, blocks-import, blocks-export, transaction-get, archive-audit, prune, check, run, mine, pool-server, pool-payout, pool-status, pool-verify, pool-pay\nRequired: --directory DIR --profile HEX --password-stdin\nPool-server requires: --pool-config NAME.json plus the chain --manifest. The pool manifest names the listen address, share ledger, payout address and each client token file; tokens are read from private .token files and never from this manifest. Optional --enable-network also syncs peers. No listener is bound before the runtime loop starts. Pool-server also accepts --stop-file NAME.stop for a clean shutdown.\nPool-payout requires: --pool-config NAME.json --pool-period N --pool-pot ATOMS. It opens no chain or network, records one exact proportional settlement in the share ledger, and signs or broadcasts nothing; keep the receipt and pay the listed addresses manually. A period can settle only once.\nPool-status requires: --pool-config NAME.json. It is read-only: it validates every client token file, opens the existing ledger, checks the pool identity and reports credited, settled and available units plus credits held by clients no longer in the manifest. It binds no socket and prints no secret.\nPool-verify requires: --pool-config NAME.json --receipt NAME.json (inside the directory). It re-reads the recorded settlement for the receipt's period and requires exact agreement on pool, client, units, atoms, address and totals; the ledger is the authority, so an edited or stale receipt fails closed. It is read-only and signs nothing.\nPool-pay requires: --pool-config NAME.json --receipt NAME.json --manifest CHAIN.json --pool-fee-atoms N --pool-expiry-blocks 1..100 --pool-batch-prefix NAME. It re-verifies the receipt, then writes new payment requests (at most 32 recipients each, never overwriting) bound to the current validated tip for the wallet's plan-payment, construct and submit flow. It selects no wallet input, signs nothing and broadcasts nothing; each batch is a separate transaction with its own fee.\nExisting identity: --public-key HEX --revision N\nCreate/set peers: --peers NAME.json\nCheck/run/mine/checkpoint-create/blocks-import/blocks-export/transaction-get/archive-audit: --manifest NAME.json\nCheckpoint-create always fully replays and emits a commitment to preserve independently. Check/run/mine/block transfers/checkpoint-prune/prune optionally accept --checkpoint TRUSTED_HEX; missing/corrupt pins never fall back.\nBlocks-import requires: --block-file NAME.monb (existing bounded page). Blocks-export requires: --block-file NAME.monb --after HEX (new file; never overwrite). Interrupted transfers may leave validated commits or a partial file; inspect before retrying. Both commands are offline.\nTransaction-get requires: --transaction HEX; optional --checkpoint TRUSTED_HEX. Returns exact authenticated bytes only for current confirmed inclusion, with tip-bound depth. Protect stdout. No mempool, delivery or finality proof; offline only.\nArchive-audit requires: --after HEX; optional --checkpoint TRUSTED_HEX. Authenticates at most sixteen canonical successors against validated archive summaries. Resume with end; at_tip describes this page only, never whole-history coverage. No saved trust flag or network.
 Checkpoint-prune requires --keep N (1..1024) and deletes older state-checkpoint generations; preserve any commitment you may still need, because a removed checkpoint cannot restore. It never creates genesis or starts networking.
-Prune requires --below HEIGHT --keep-blocks N; optional --checkpoint TRUSTED_HEX. It commits a state snapshot first, then removes block bodies strictly below the boundary (minimal --below is 1; it must satisfy below <= tip - keep and must not exceed a configured finality pin/anchor; pass the same --finality-pin as run to apply that guard). Reopening a pruned database requires the emitted chain_checkpoint as --checkpoint; a pruned node refuses reorgs that would drop the retained boundary block, while reorgs above it remain valid. It never creates genesis or starts networking.\nSubmission-create requires: --submission-inbox NAME (explicit private local inbox; no chain creation).\nSubmission-forget requires: --submission-inbox NAME --submission HEX --acknowledge-not-cancellation.\nSubmission-rotate requires: --submission-inbox NAME --new-submission-inbox NAME --acknowledge-not-cancellation.\nMaintenance changes delivery history only; never cancels signatures or releases wallet claims. Retry interrupted rotation with the same source/target names.\nRun also requires: --enable-network; optional --submission-inbox NAME consumes the existing pinned inbox.\nMine also requires: --enable-mining --miner-address ADDRESS --miner-workers auto|1..128 --miner-network main|test|regtest.\nMine is an explicit local CPU miner over an existing validated chain and never creates genesis or a chain database. Workers share a 256 MiB RandomX cache, with an independent scratchpad per worker; the local CPU and memory budget caps accepted workers. --enable-network is optional; without it mine runs a local-only loop. Optional pool mode: --pool-mode official|custom --pool-public-key HEX --pool-client HEX --pool-token-file NAME.token. Official uses the published default host pool.monario.org (provisional and authenticated by the configured key); custom also requires --pool-address HOST:PORT. The token file must contain exactly 64 lowercase hex characters and be private on Unix; tokens are never accepted from arguments or the environment. Pool mode opens one authenticated, encrypted outbound connection, cancels workers when the assignment changes or the session closes, and submits shares to the pool; it does not submit blocks to the local node and shares are not payouts. No Stratum V2 interoperability is claimed. Run and mine optionally accept --status-file NAME.json, a bounded public snapshot (profile, tip, height, peers, mining job/workers/accepted) under the identity directory for local dashboards; --stop-file NAME.stop requests a clean shutdown when that regular file appears under the same directory. Run and mine optionally accept --finality-pin NAME.json (source operator|signed, height, hash, mode warn|refuse): an opt-in local finality policy; a signed pin requires a threshold of configured signer signatures over the Monario/finality-pin/v1 domain. --no-checkpoint-anchor explicitly bypasses the shipped deep anchor. Finality pins are local policy, not consensus finality: they bound reorg depth and protect long syncs, and do not stop a majority miner from reorging recent blocks. Run and mine optionally accept --enable-rpc --rpc-bind IP:PORT --rpc-token-file NAME.token [--rpc-allow-remote]: an explicit, read-only, token-authenticated management listener. The bind is loopback-only unless --rpc-allow-remote is set. The token file must contain exactly 64 lowercase hex characters (optional trailing newline) and be private on Unix. RPC exposes only status/block/transaction/mempool/peers/candidates/ping; it never signs, mines, mutates or exports keys. Run and mine optionally accept --enable-scan --scan-bind IP:PORT --scan-token-file NAME.token [--scan-allow-remote]: a bounded, read-only, token-authenticated page transport for wallet bootstrap. The bind is loopback-only unless --scan-allow-remote is set; every connection is an encrypted Noise session pinned to the scan_public_key published in the startup receipt, so a remote wallet must supply that key. It never serves wallet queries, mutates chain state or accepts peer-supplied trust. Ctrl-C/SIGTERM cancels workers and requests clean shutdown. Pool mode is opt-in; shares are policy units and provide no on-chain payout.\n\nPasswords: non-terminal stdin, u16 little-endian byte length followed by 12..1024 exact bytes, then EOF. Password-change reads old and new frames. Never pass passwords in arguments/environment.\nReceipts go to stdout; preserve them independently. No command creates a chain database or genesis. Run and mine explicitly activate their runtime; Ctrl-C/SIGTERM requests shutdown.\n";
+Prune requires --below HEIGHT --keep-blocks N; optional --checkpoint TRUSTED_HEX. It commits a state snapshot first, then removes block bodies strictly below the boundary (minimal --below is 1; it must satisfy below <= tip - keep and must not exceed a configured finality pin/anchor; pass the same --finality-pin as run to apply that guard). Reopening a pruned database requires the emitted chain_checkpoint as --checkpoint; a pruned node refuses reorgs that would drop the retained boundary block, while reorgs above it remain valid. It never creates genesis or starts networking.\nSubmission-create requires: --submission-inbox NAME (explicit private local inbox; no chain creation).\nSubmission-forget requires: --submission-inbox NAME --submission HEX --acknowledge-not-cancellation.\nSubmission-rotate requires: --submission-inbox NAME --new-submission-inbox NAME --acknowledge-not-cancellation.\nMaintenance changes delivery history only; never cancels signatures or releases wallet claims. Retry interrupted rotation with the same source/target names.\nRun also requires: --enable-network; optional --submission-inbox NAME consumes the existing pinned inbox.\nMine also requires: --enable-mining --miner-workers auto|1..128 --miner-network main|test|regtest. Solo mode requires --miner-address ADDRESS.\nMine is an explicit local CPU miner over an existing validated chain and never creates genesis or a chain database. Workers share a 256 MiB RandomX cache, with an independent scratchpad per worker; the local CPU and memory budget cap accepted workers. --enable-network is optional; without it mine runs a local-only loop. Custom pool: --pool-mode custom --pool-address HOST:PORT --pool-credential-stdin adds a second framed input after the node password. Obtain monp1:POOL_KEY:CLIENT_ID:TOKEN from the pool operator through a trusted channel. Existing custom --pool-public-key HEX --pool-client HEX --pool-token-file NAME.token remains supported as an alternative. Pool mode opens one authenticated, encrypted outbound connection, cancels workers when the assignment changes or the session closes, and submits shares to the pool; it does not submit blocks to the local node and shares are not payouts. No Stratum V2 interoperability is claimed. Run and mine optionally accept --status-file NAME.json, a bounded public snapshot (profile, tip, height, peers, mining job/workers/accepted) under the identity directory for local dashboards; --stop-file NAME.stop requests a clean shutdown when that regular file appears under the same directory. Run and mine optionally accept --finality-pin NAME.json (source operator|signed, height, hash, mode warn|refuse): an opt-in local finality policy; a signed pin requires a threshold of configured signer signatures over the Monario/finality-pin/v1 domain. --no-checkpoint-anchor explicitly bypasses the shipped deep anchor. Finality pins are local policy, not consensus finality: they bound reorg depth and protect long syncs, and do not stop a majority miner from reorging recent blocks. Run and mine optionally accept --enable-rpc --rpc-bind IP:PORT --rpc-token-file NAME.token [--rpc-allow-remote]: an explicit, read-only, token-authenticated management listener. The bind is loopback-only unless --rpc-allow-remote is set. The token file must contain exactly 64 lowercase hex characters (optional trailing newline) and be private on Unix. RPC exposes only status/block/transaction/mempool/peers/candidates/ping; it never signs, mines, mutates or exports keys. Run and mine optionally accept --enable-scan --scan-bind IP:PORT --scan-token-file NAME.token [--scan-allow-remote]: a bounded, read-only, token-authenticated page transport for wallet bootstrap. The bind is loopback-only unless --scan-allow-remote is set; every connection is an encrypted Noise session pinned to the scan_public_key published in the startup receipt, so a remote wallet must supply that key. It never serves wallet queries, mutates chain state or accepts peer-supplied trust. Ctrl-C/SIGTERM cancels workers and requests clean shutdown. Pool mode is opt-in; shares are policy units and provide no on-chain payout.\n\nPasswords: non-terminal stdin, u16 little-endian byte length followed by 12..1024 exact bytes, then EOF. Password-change reads old and new frames. Never pass passwords in arguments/environment.\nReceipts go to stdout; preserve them independently. No command creates a chain database or genesis. Run and mine explicitly activate their runtime; Ctrl-C/SIGTERM requests shutdown.\n";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
     Help,
@@ -146,9 +147,23 @@ struct Mining {
 #[derive(Clone)]
 struct PoolMining {
     address: String,
+    credentials: PoolCredentials,
+}
+
+#[derive(Clone, Debug)]
+enum PoolCredentials {
+    Stdin,
+    File {
+        public_key: [u8; 32],
+        client: [u8; 16],
+        token_file: String,
+    },
+}
+
+struct PoolAuth {
     public_key: [u8; 32],
     client: [u8; 16],
-    token_file: String,
+    token: Zeroizing<[u8; 32]>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -161,6 +176,9 @@ pub enum Error {
     Runtime,
     Mining,
     MiningCapacity,
+    /// Fixed diagnostic for an explicit pool credential rejection. Carries no
+    /// host, token, path or peer text.
+    PoolAuth,
     Transfer,
     Pruned,
 }
@@ -178,6 +196,7 @@ impl Error {
             Self::Runtime => "node runtime failed",
             Self::Mining => "mining failed; inspect configuration and validated chain state",
             Self::MiningCapacity => "worker count exceeds the local CPU or memory budget; use --miner-workers auto or try a smaller count",
+            Self::PoolAuth => "the pool rejected this mining credential; verify the credential issued by the pool operator, then restart mining",
             Self::Transfer => {
                 "block transfer failed; a validated prefix or partial export may remain; inspect before retrying"
             }
@@ -237,6 +256,7 @@ impl Command {
                     | "--manifest"
                     | "--root-ceremony"
                     | "--password-stdin"
+                    | "--pool-credential-stdin"
                     | "--enable-network"
                     | "--submission-inbox"
                     | "--submission"
@@ -283,6 +303,7 @@ impl Command {
             let value = if matches!(
                 flag,
                 "--password-stdin"
+                    | "--pool-credential-stdin"
                     | "--enable-network"
                     | "--enable-mining"
                     | "--enable-rpc"
@@ -474,8 +495,8 @@ impl Command {
             if options.remove("--enable-mining").is_none() {
                 return Err(Error::Arguments);
             }
-            let address = text(options.remove("--miner-address"))?;
-            if address.is_empty() || address.len() > 128 {
+            let address = options.remove("--miner-address").map(|value| text(Some(value))).transpose()?.unwrap_or_default();
+            if address.len() > 128 {
                 return Err(Error::Arguments);
             }
             let network = match text(options.remove("--miner-network"))?.as_str() {
@@ -486,77 +507,64 @@ impl Command {
             };
             let requested = text(options.remove("--miner-workers"))?;
             let workers = if requested == "auto" {
-                monario_randomx::mining_worker_limit()
+                let limit = monario_randomx::mining_worker_limit();
+                if limit == 0 {
+                    return Err(Error::MiningCapacity);
+                }
+                limit
             } else {
                 if requested.is_empty() || !requested.bytes().all(|b| b.is_ascii_digit()) {
                     return Err(Error::Arguments);
                 }
                 requested.parse::<u8>().map_err(|_| Error::Arguments)?
             };
-            if !(1..=monario_randomx::MAX_WORKERS).contains(&workers) {
-                return Err(if requested == "auto" {
-                    Error::MiningCapacity
-                } else {
-                    Error::Arguments
-                });
+            if !(1..=crate::mining::operator::MAX_WORKERS).contains(&workers) {
+                return Err(Error::Arguments);
             }
-            let pool_mode = options.remove("--pool-mode");
+            let pool_mode = options
+                .remove("--pool-mode")
+                .map(|mode| text(Some(mode)))
+                .transpose()?;
             let pool_address = options.remove("--pool-address");
             let pool_public_key = options.remove("--pool-public-key");
             let pool_client = options.remove("--pool-client");
             let pool_token_file = options.remove("--pool-token-file");
-            let pool = match pool_mode {
-                None => {
-                    if pool_address.is_some()
-                        || pool_public_key.is_some()
-                        || pool_client.is_some()
-                        || pool_token_file.is_some()
-                    {
-                        return Err(Error::Arguments);
-                    }
+            let pool_stdin = options.remove("--pool-credential-stdin").is_some();
+            let uses_legacy =
+                pool_public_key.is_some() || pool_client.is_some() || pool_token_file.is_some();
+            let pool = match pool_mode.as_deref() {
+                None | Some("solo") if !uses_legacy && pool_address.is_none() && !pool_stdin => {
                     None
                 }
-                Some(mode) => {
-                    let mode = text(Some(mode))?;
-                    match mode.as_str() {
-                        "solo" => {
-                            if pool_address.is_some()
-                                || pool_public_key.is_some()
-                                || pool_client.is_some()
-                                || pool_token_file.is_some()
-                            {
-                                return Err(Error::Arguments);
-                            }
-                            None
+                Some("custom") if !pool_stdin || !uses_legacy => {
+                    let address = pool_endpoint(&text(pool_address)?)?;
+                    let credentials = if pool_stdin {
+                        PoolCredentials::Stdin
+                    } else {
+                        let public_key = hash(&text(pool_public_key)?)?;
+                        let client = client_id(&text(pool_client)?)?;
+                        let token_file = name(&text(pool_token_file)?)?;
+                        if !token_file.ends_with(".token") {
+                            return Err(Error::Arguments);
                         }
-                        "official" | "custom" => {
-                            let official = mode == "official";
-                            let address = if official {
-                                if pool_address.is_some() {
-                                    // The official pool host is fixed; only custom takes an address.
-                                    return Err(Error::Arguments);
-                                }
-                                OFFICIAL_POOL_ADDRESS.to_owned()
-                            } else {
-                                pool_endpoint(&text(pool_address)?)?
-                            };
-                            let public_key = hash(&text(pool_public_key)?)?;
-                            let client = client_id(&text(pool_client)?)?;
-                            let token_file = name(&text(pool_token_file)?)?;
-                            if !token_file.ends_with(".token") {
-                                return Err(Error::Arguments);
-                            }
-                            Some(PoolMining {
-                                address,
-                                public_key,
-                                client,
-                                token_file,
-                            })
+                        PoolCredentials::File {
+                            public_key,
+                            client,
+                            token_file,
                         }
-                        _ => return Err(Error::Arguments),
-                    }
+                    };
+                    Some(PoolMining {
+                        address,
+                        credentials,
+                    })
                 }
+                _ => return Err(Error::Arguments),
             };
+            if pool.is_none() {
+                // Decode the real address against the requested network before
+                // any node is opened, store unlocked or socket activated.
+                validate_solo_address(&address, network).map_err(|_| Error::Configuration)?;
+            }
             command.mining = Some(Mining {
                 address,
                 network,
@@ -977,7 +985,7 @@ fn token_file(root: &Path, file: &str) -> Result<Vec<u8>, Error> {
     }
     bounded(root, &file, 65)
 }
-fn password(input: &mut impl Read) -> Result<Password, Error> {
+fn secret_frame(input: &mut impl Read) -> Result<Zeroizing<Vec<u8>>, Error> {
     let mut len = [0; 2];
     input.read_exact(&mut len).map_err(|_| Error::Credentials)?;
     let len = usize::from(u16::from_le_bytes(len));
@@ -988,7 +996,41 @@ fn password(input: &mut impl Read) -> Result<Password, Error> {
     input
         .read_exact(&mut bytes)
         .map_err(|_| Error::Credentials)?;
-    Password::from_bytes(&bytes).map_err(|_| Error::Credentials)
+    Ok(bytes)
+}
+
+fn password(input: &mut impl Read) -> Result<Password, Error> {
+    Password::from_bytes(&secret_frame(input)?).map_err(|_| Error::Credentials)
+}
+
+fn pool_auth(frame: &[u8]) -> Result<PoolAuth, Error> {
+    let mut fields = std::str::from_utf8(frame)
+        .map_err(|_| Error::Credentials)?
+        .split(':');
+    let (Some("monp1"), Some(key), Some(id), Some(token), None) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return Err(Error::Credentials);
+    };
+    let public_key = hash(key).map_err(|_| Error::Credentials)?;
+    let client = client_id(id).map_err(|_| Error::Credentials)?;
+    if token.len() != 64 {
+        return Err(Error::Credentials);
+    }
+    let token =
+        Zeroizing::new(crate::rpc::parse_token(token.as_bytes()).map_err(|_| Error::Credentials)?);
+    if public_key == [0; 32] || client == [0; 16] || *token == [0; 32] {
+        return Err(Error::Credentials);
+    }
+    Ok(PoolAuth {
+        public_key,
+        client,
+        token,
+    })
 }
 #[derive(Serialize)]
 struct Receipt {
@@ -1096,6 +1138,18 @@ impl StatusWriter {
         self.force_with(node, now_ms, mining, None);
     }
 
+    /// Final snapshot that preserves a terminal pool phase such as a rejected
+    /// credential, so the reader sees it after the process exits.
+    fn force_pool(&mut self, node: &Node, now_ms: u64, pool: &PoolStatus) {
+        let synthetic = OperatorStatus {
+            refreshed: pool.assigned,
+            accepted: None,
+            workers: pool.workers,
+            job: None,
+        };
+        self.force_with(node, now_ms, Some(&synthetic), Some(pool));
+    }
+
     fn maybe_with(
         &mut self,
         node: &Node,
@@ -1145,6 +1199,7 @@ impl StatusWriter {
         };
         let value = serde_json::json!({
             "version": 1,
+            "pid": std::process::id(),
             "profile": hex(&chain.validation_profile()),
             "tip": hex(&chain.tip()),
             "height": chain.height().to_string(),
@@ -1168,6 +1223,7 @@ impl StatusWriter {
             })),
             "pool": pool.map(|status| serde_json::json!({
                 "connected": status.connected,
+                "phase": status.phase.label(),
                 "assigned": status.assigned,
                 "workers": status.workers,
                 "submitted": status.submitted,
@@ -1250,13 +1306,15 @@ pub fn execute(
         }
         _ => None,
     };
-    execute_with(
+    let pool_rejected = Arc::new(AtomicBool::new(false));
+    let rejected = Arc::clone(&pool_rejected);
+    let outcome = execute_with_pool(
         command,
         input,
         output,
         stop,
         install_signals,
-        move |driver, node, stop| {
+        move |driver, node, stop, stdin_pool_auth| {
             let mut status = status;
             let mut stop_control = stop_control;
             let mut rpc = rpc;
@@ -1310,12 +1368,26 @@ pub fn execute(
                 let root = directory
                     .canonicalize()
                     .map_err(|_| crate::Error::Configuration)?;
-                let token = {
-                    let bytes = token_file(&root, &pool.token_file)
-                        .map_err(|_| crate::Error::Configuration)?;
-                    Zeroizing::new(
-                        crate::rpc::parse_token(&bytes).map_err(|_| crate::Error::Configuration)?,
-                    )
+                let auth = match pool.credentials {
+                    PoolCredentials::Stdin => stdin_pool_auth.ok_or(crate::Error::Configuration)?,
+                    PoolCredentials::File {
+                        public_key,
+                        client,
+                        token_file: file,
+                    } => {
+                        let bytes = Zeroizing::new(
+                            token_file(&root, &file).map_err(|_| crate::Error::Configuration)?,
+                        );
+                        let token = Zeroizing::new(
+                            crate::rpc::parse_token(&bytes)
+                                .map_err(|_| crate::Error::Configuration)?,
+                        );
+                        PoolAuth {
+                            public_key,
+                            client,
+                            token,
+                        }
+                    }
                 };
                 // Fail closed: resolution failure never falls back to solo mining.
                 let resolved = pool
@@ -1328,10 +1400,10 @@ pub fn execute(
                 let config = PoolOperatorConfig {
                     identity: Identity::generate().map_err(|_| crate::Error::Mining)?,
                     pool: resolved,
-                    pool_key: pool.public_key,
+                    pool_key: auth.public_key,
                     profile,
-                    client: pool.client,
-                    token,
+                    client: auth.client,
+                    token: auth.token,
                     workers: mining.workers,
                     poll_ms: 1_000,
                     connect_timeout_ms: 10_000,
@@ -1345,6 +1417,7 @@ pub fn execute(
                 if let Some(writer) = status.as_mut() {
                     writer.force(node, 0, None);
                 }
+                let mut terminal: Option<PoolStatus> = None;
                 let result = if network {
                     driver.run_with(node, stop, |node, clock| {
                         if let Some(control) = stop_control.as_mut() {
@@ -1360,9 +1433,19 @@ pub fn execute(
                                 .poll(node, clock.monotonic_ms)
                                 .map_err(|_| crate::Error::Io)?;
                         }
-                        let tick = operator
-                            .tick(node, clock)
-                            .map_err(|_| crate::Error::Mining)?;
+                        let tick = match operator.tick(node, clock) {
+                            Ok(tick) => tick,
+                            Err(error) => {
+                                if matches!(error, crate::mining::operator::Error::PoolAuth) {
+                                    let snapshot = operator.status();
+                                    if let Some(writer) = status.as_mut() {
+                                        writer.force_pool(node, clock.monotonic_ms, &snapshot);
+                                    }
+                                    terminal = Some(snapshot);
+                                }
+                                return Err(crate::Error::Mining);
+                            }
+                        };
                         if let Some(writer) = status.as_mut() {
                             writer.maybe_pool(node, clock.monotonic_ms, &tick);
                         }
@@ -1391,10 +1474,24 @@ pub fn execute(
                         })
                         .map_err(|_| crate::Error::Mining)
                 };
+                // Preserve a credential rejection through shutdown so a status
+                // reader still sees the terminal phase after the process exits.
+                if terminal.is_none() {
+                    let snapshot = operator.status();
+                    if snapshot.phase == crate::mining::pool::tcp::Phase::Rejected {
+                        terminal = Some(snapshot);
+                    }
+                }
                 operator.shutdown();
                 let shutdown = node.shutdown().map_err(|_| crate::Error::Storage);
                 if let Some(writer) = status.as_mut() {
-                    writer.force(node, 0, None);
+                    match &terminal {
+                        Some(pool) => writer.force_pool(node, 0, pool),
+                        None => writer.force(node, 0, None),
+                    }
+                }
+                if terminal.is_some() {
+                    rejected.store(true, Ordering::Release);
                 }
                 return result.and(shutdown);
             }
@@ -1472,11 +1569,18 @@ pub fn execute(
                 result.and(shutdown)
             }
         },
-    )
+    );
+    if pool_rejected.load(Ordering::Acquire) {
+        return Err(Error::PoolAuth);
+    }
+    outcome
 }
 /// Explicitly activated pool server. Binds one authenticated listener inside the
 /// caller's existing node loop, opens the durable share ledger and never mines.
-/// Shares are server-policy units; nothing here pays a miner on chain.
+/// Before the listener is polled, unresolved block-candidate reservations are
+/// reconciled against the durable node block index; a finalize failure fails
+/// startup closed. Shares are server-policy units; nothing here pays a miner
+/// on chain.
 fn run_pool(
     driver: crate::transport::persistent::PersistentDriver,
     node: &mut Node,
@@ -1534,11 +1638,31 @@ fn run_pool(
     let mut stop_control = stop_file
         .map(|file| StopControl::new(root, file))
         .transpose()?;
+    // Credit only reservations proven by the node's durable block index. This
+    // runs before the pool loop binds or accepts anything.
+    crate::mining::pool::session::reconcile_pending(node, &mut ledger)
+        .map_err(|_| Error::Mining)?;
     let mut manager =
         crate::mining::refresh::Manager::new(config.payout_address, config.network, Vec::new());
+    // Bounded runtime recovery: only when unresolved rows remain, retry at a
+    // conservative interval from the caller's monotonic clock. I/O or finalize
+    // failure stops the loop closed; rows without durable proof are retained.
+    const RECOVERY_INTERVAL_MS: u64 = 30_000;
+    let mut last_recovery: Option<u64> = None;
     let result = driver.run_with(node, stop, |node, clock| {
         if let Some(control) = stop_control.as_mut() {
             control.check(stop, clock.monotonic_ms);
+        }
+        let pending = ledger
+            .pending_count()
+            .map_err(|_| crate::Error::Storage)?;
+        if pending > 0
+            && last_recovery
+                .is_none_or(|at| clock.monotonic_ms.saturating_sub(at) >= RECOVERY_INTERVAL_MS)
+        {
+            last_recovery = Some(clock.monotonic_ms);
+            crate::mining::pool::session::reconcile_pending(node, &mut ledger)
+                .map_err(|_| crate::Error::Storage)?;
         }
         pool.poll(node, &mut manager, &mut ledger, stop, clock)
             .map_err(|_| crate::Error::Mining)?;
@@ -1553,6 +1677,7 @@ fn install_signals(stop: &Arc<AtomicBool>) -> Result<(), Error> {
     ctrlc::set_handler(move || signal.store(true, Ordering::Release)).map_err(|_| Error::Signal)
 }
 // Private test seam: neither CLI flags nor production environment can replace activation.
+#[cfg(test)]
 fn execute_with(
     command: Command,
     input: &mut impl Read,
@@ -1563,6 +1688,24 @@ fn execute_with(
         crate::transport::persistent::PersistentDriver,
         &mut Node,
         &AtomicBool,
+    ) -> Result<(), crate::Error>,
+) -> Result<(), Error> {
+    execute_with_pool(command, input, output, stop, install, |driver, node, stop, _| {
+        run(driver, node, stop)
+    })
+}
+
+fn execute_with_pool(
+    command: Command,
+    input: &mut impl Read,
+    output: &mut impl Write,
+    stop: &Arc<AtomicBool>,
+    install: impl FnOnce(&Arc<AtomicBool>) -> Result<(), Error>,
+    run: impl FnOnce(
+        crate::transport::persistent::PersistentDriver,
+        &mut Node,
+        &AtomicBool,
+        Option<PoolAuth>,
     ) -> Result<(), crate::Error>,
 ) -> Result<(), Error> {
     if command.action == Action::Help {
@@ -1613,6 +1756,17 @@ fn execute_with(
         Some(password(input)?)
     } else {
         None
+    };
+    let stdin_pool_auth = match command
+        .mining
+        .as_ref()
+        .and_then(|mining| mining.pool.as_ref())
+    {
+        Some(PoolMining {
+            credentials: PoolCredentials::Stdin,
+            ..
+        }) => Some(pool_auth(&secret_frame(input)?)?),
+        _ => None,
     };
     let mut extra = [0; 1];
     if input.read(&mut extra).map_err(|_| Error::Credentials)? != 0 {
@@ -2074,7 +2228,7 @@ fn execute_with(
                     node.shutdown().map_err(|_| Error::Runtime)?;
                     return result;
                 }
-                run(driver, &mut node, stop).map_err(|error| {
+                run(driver, &mut node, stop, stdin_pool_auth).map_err(|error| {
                     if error == crate::Error::Mining {
                         Error::Mining
                     } else {

@@ -17,9 +17,8 @@ use std::{
 };
 use zeroize::Zeroizing;
 
-pub use monario_randomx::MAX_WORKERS;
-
 pub const ATOMS_PER_MONAR: u64 = 100_000_000;
+pub use monario_randomx::MAX_WORKERS;
 pub const MAX_ARG_BYTES: usize = 4096;
 pub const MAX_ARGS: usize = 48;
 pub const MAX_OUTPUT_BYTES: usize = 256 * 1024;
@@ -127,11 +126,20 @@ impl std::error::Error for BackendError {}
 
 /// A bounded invocation. Password frames are held in zeroizing strings and are
 /// never placed in `args` or in the environment.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CommandSpec {
     pub program: Program,
     pub args: Vec<String>,
     frames: Vec<Zeroizing<String>>,
+}
+
+impl std::fmt::Debug for CommandSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommandSpec")
+            .field("program", &self.program)
+            .field("args", &self.args)
+            .finish_non_exhaustive()
+    }
 }
 
 impl CommandSpec {
@@ -156,7 +164,7 @@ impl CommandSpec {
                 "an unexpected number of password frames was supplied".into(),
             ));
         }
-        let mut out = Vec::new();
+        let mut out = Zeroizing::new(Vec::new());
         for frame in &self.frames {
             let len = frame.len();
             if !(MIN_SECRET..=MAX_SECRET).contains(&len) {
@@ -172,7 +180,7 @@ impl CommandSpec {
                 "password frames are too large".into(),
             ));
         }
-        Ok(Zeroizing::new(out))
+        Ok(out)
     }
 
     pub fn validate(&self) -> Result<(), BackendError> {
@@ -339,98 +347,114 @@ impl SubmitTarget {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MiningConfig {
+#[derive(Clone)]
+pub struct MiningConfig<'a> {
     pub address: String,
     pub workers: u8,
     pub network: Network,
-    #[serde(default)]
     pub pool_mode: PoolMode,
-    #[serde(default)]
-    pub pool: Option<PoolSpec>,
+    pub pool: Option<PoolSpec<'a>>,
 }
 
-/// Mining source selected by the operator. `Solo` uses the local node only;
-/// `Official` uses the published pool host; `Custom` uses an explicit endpoint.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PoolMode {
-    #[default]
-    Solo,
-    Official,
     Custom,
+    #[default]
+    #[serde(other)]
+    Solo,
 }
 
 impl PoolMode {
-    pub const ALL: [Self; 3] = [Self::Solo, Self::Official, Self::Custom];
+    pub const ALL: [Self; 2] = [Self::Solo, Self::Custom];
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Solo => "Solo (own node)",
-            Self::Official => "Monario pool preset",
+            Self::Solo => "Solo",
             Self::Custom => "Custom pool",
         }
     }
 }
 
-/// Published default for the official pool. Provisional: it is a name default
-/// authenticated by the configured pool key, not an implicit trust anchor. This
-/// GUI never claims a live pool or Stratum V2 interoperability.
-pub const OFFICIAL_POOL_ADDRESS: &str = "pool.monario.org:19444";
-
-/// Non-secret pool selectors. The token is a local secret referenced by file
-/// name only; the GUI never persists or passes the token value itself.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PoolSpec {
+#[derive(Clone)]
+pub struct PoolSpec<'a> {
     pub address: String,
-    pub public_key: String,
-    pub client: String,
-    pub token_file: String,
+    pub credential: &'a Zeroizing<String>,
 }
 
-impl PoolSpec {
-    fn validate(&self, mode: PoolMode) -> Result<(), BackendError> {
-        validate_hex(&self.public_key, 32, "pool public key")?;
-        validate_hex(&self.client, 16, "pool client id")?;
-        validate_filename(&self.token_file)?;
-        if !self.token_file.ends_with(".token") {
-            return Err(BackendError::Invalid(
-                "the pool token file must end with .token".into(),
-            ));
-        }
-        match mode {
-            PoolMode::Custom => validate_pool_endpoint(&self.address),
-            PoolMode::Official => {
-                if self.address.is_empty() || self.address == OFFICIAL_POOL_ADDRESS {
-                    Ok(())
-                } else {
-                    Err(BackendError::Invalid(
-                        "the official pool host is fixed; use custom for another endpoint".into(),
-                    ))
-                }
-            }
-            PoolMode::Solo => Err(BackendError::Invalid(
-                "solo mode must not carry pool credentials".into(),
-            )),
-        }
-    }
-}
-
-impl MiningConfig {
+impl MiningConfig<'_> {
     pub fn validate(&self) -> Result<(), BackendError> {
-        validate_address(&self.address)?;
         validate_workers(self.workers)?;
         match (self.pool_mode, self.pool.as_ref()) {
-            (PoolMode::Solo, None) => Ok(()),
-            (PoolMode::Solo, Some(_)) => Err(BackendError::Invalid(
-                "solo mode must not carry pool credentials".into(),
+            (PoolMode::Solo, None) => validate_solo_address(&self.address, self.network),
+            (PoolMode::Custom, Some(pool)) => {
+                validate_pool_endpoint(&pool.address)?;
+                validate_pool_credential(pool.credential)
+            }
+            _ => Err(BackendError::Invalid(
+                "pool settings do not match the mining mode".into(),
             )),
-            (PoolMode::Official | PoolMode::Custom, None) => Err(BackendError::Invalid(
-                "a pool mode requires a public key, client id and token file".into(),
-            )),
-            (mode, Some(pool)) => pool.validate(mode),
         }
     }
+}
+
+/// Validate a solo payout destination with real `monario-address` decoding for
+/// the selected network. Private receivers cannot receive a coinbase payout.
+pub fn validate_solo_address(address: &str, network: Network) -> Result<(), BackendError> {
+    let address = address.trim();
+    if address.is_empty() || address.len() > 128 {
+        return Err(BackendError::Invalid("enter a solo payout address".into()));
+    }
+    let expected = match network {
+        Network::Main => monario_address::Network::Main,
+        Network::Test => monario_address::Network::Test,
+        Network::Regtest => monario_address::Network::Regtest,
+    };
+    match monario_address::Address::decode(address, expected) {
+        Ok(decoded) => match decoded.receiver() {
+            monario_address::Receiver::Transparent(_) => Ok(()),
+            monario_address::Receiver::Private(_) => Err(BackendError::Invalid(
+                "solo mining needs a transparent payout address".into(),
+            )),
+        },
+        Err(_) => Err(BackendError::Invalid(
+            "invalid solo payout address for the selected network".into(),
+        )),
+    }
+}
+
+fn validate_pool_credential(value: &str) -> Result<(), BackendError> {
+    let mut fields = value.split(':');
+    if let (Some("monp1"), Some(key), Some(client), Some(token), None) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) && [(key, 32), (client, 16), (token, 32)]
+        .into_iter()
+        .all(|(field, len)| {
+            validate_hex(field, len, "pool credential").is_ok()
+                && field.bytes().any(|byte| byte != b'0')
+        })
+    {
+        return Ok(());
+    }
+    Err(BackendError::Invalid(
+        "paste the pool credential issued by your pool operator".into(),
+    ))
+}
+
+pub fn pool_endpoint(host: &str, port: &str) -> Result<String, BackendError> {
+    let host = host.trim();
+    let port = port.trim();
+    let value = if let Ok(address) = host.parse::<std::net::Ipv6Addr>() {
+        format!("[{address}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    validate_pool_endpoint(&value)?;
+    Ok(value)
 }
 
 // ---------------------------------------------------------------------------
@@ -888,7 +912,17 @@ impl ManagedNode {
     }
 
     pub fn status(&self) -> Result<NodeStatus, BackendError> {
-        read_status(&self.status_path)
+        let status = read_status(&self.status_path)?;
+        // A stale snapshot from an earlier child must not surface while this
+        // child is starting. Snapshots written before pid was emitted stay valid.
+        if let Some(pid) = status.pid
+            && pid != self.pid
+        {
+            return Err(BackendError::Invalid(
+                "the status snapshot belongs to another process".into(),
+            ));
+        }
+        Ok(status)
     }
 
     pub fn stop(&mut self, timeout: Duration) -> StopOutcome {
@@ -986,6 +1020,10 @@ pub struct CandidateStatus {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct NodeStatus {
     pub version: u8,
+    /// Emitting process id. Older snapshots omit it; a terminal phase is only
+    /// trusted when this matches the exact managed child.
+    #[serde(default)]
+    pub pid: Option<u32>,
     pub profile: String,
     pub tip: String,
     pub height: String,
@@ -1016,11 +1054,32 @@ pub struct MiningStatus {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct PoolStatusView {
     pub connected: bool,
+    #[serde(default)]
+    pub phase: Option<PoolPhase>,
     pub assigned: bool,
     pub workers: usize,
     pub submitted: u64,
     pub block_candidates: u64,
 }
+
+/// Client connection lifecycle from the node snapshot. An open transport or a
+/// pending handshake is not an authenticated session, and a rejected credential
+/// is not a later job/share rejection.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PoolPhase {
+    Offline,
+    Handshake,
+    Authenticating,
+    Authenticated,
+    Rejected,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Exact fixed diagnostic for an explicit pool credential rejection. Shown
+/// instead of raw child stderr or any secret.
+pub const POOL_AUTH_REJECTED: &str = "The pool rejected this mining credential. Mining is stopped; correct the credential issued by your pool operator and start mining again.";
 
 pub fn read_status(path: &Path) -> Result<NodeStatus, BackendError> {
     let meta =
@@ -1697,12 +1756,12 @@ pub fn node_mine(
     checkpoint: &str,
     status_file: &str,
     stop_file: &str,
-    mining: &MiningConfig,
+    mining: &MiningConfig<'_>,
     network: bool,
     password: &Zeroizing<String>,
 ) -> Result<CommandSpec, BackendError> {
     mining.validate()?;
-    let (mut args, secrets) = launch_spec(
+    let (mut args, mut secrets) = launch_spec(
         "mine",
         node,
         manifest,
@@ -1714,40 +1773,22 @@ pub fn node_mine(
     )?;
     args.extend([
         "--enable-mining".into(),
-        "--miner-address".into(),
-        mining.address.clone(),
         "--miner-workers".into(),
         mining.workers.to_string(),
         "--miner-network".into(),
         mining.network.as_str().into(),
     ]);
-    match (mining.pool_mode, mining.pool.as_ref()) {
-        (PoolMode::Solo, _) => {}
-        (mode, Some(pool)) => {
-            let official = mode == PoolMode::Official;
-            args.extend([
-                "--pool-mode".into(),
-                if official {
-                    "official".to_owned()
-                } else {
-                    "custom".to_owned()
-                },
-                "--pool-public-key".into(),
-                pool.public_key.clone(),
-                "--pool-client".into(),
-                pool.client.clone(),
-                "--pool-token-file".into(),
-                pool.token_file.clone(),
-            ]);
-            if !official {
-                args.extend(["--pool-address".into(), pool.address.clone()]);
-            }
-        }
-        (_, None) => {
-            return Err(BackendError::Invalid(
-                "a pool mode requires credentials".into(),
-            ));
-        }
+    if let Some(pool) = &mining.pool {
+        args.extend([
+            "--pool-mode".into(),
+            "custom".into(),
+            "--pool-address".into(),
+            pool.address.clone(),
+            "--pool-credential-stdin".into(),
+        ]);
+        secrets.push(pool.credential.clone());
+    } else {
+        args.extend(["--miner-address".into(), mining.address.clone()]);
     }
     if network {
         args.push("--enable-network".into());

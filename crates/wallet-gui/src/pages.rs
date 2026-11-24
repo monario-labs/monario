@@ -2,8 +2,9 @@
 //! boundary stays in one place.
 use crate::app::{GuiApp, NodeKind, OpenMode, Page, atom_text};
 use crate::backend::{self, AddressKind, Network, PoolMode};
-use crate::theme::{self, *};
-use eframe::egui::{self, RichText, Vec2};
+use crate::theme;
+use eframe::egui::{self, Vec2};
+use zeroize::Zeroize;
 
 pub(crate) fn onboard_form(app: &mut GuiApp, ui: &mut egui::Ui) {
     match app.open_mode {
@@ -199,16 +200,14 @@ fn new_password_entry(app: &mut GuiApp, ui: &mut egui::Ui, hint: &str) {
     }
 }
 
-fn page_header(ui: &mut egui::Ui, section: &str, title: &str, subtitle: &str) {
-    ui.label(theme::section(section));
-    ui.add_space(2.0);
+fn page_header(ui: &mut egui::Ui, title: &str, subtitle: &str) {
     ui.label(theme::title(title));
     ui.label(theme::subtitle(subtitle));
     ui.add_space(14.0);
 }
 
 fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
-    theme::card().show(ui, |ui| {
+    theme::card(ui).show(ui, |ui| {
         ui.set_width(ui.available_width());
         add(ui);
     });
@@ -219,9 +218,8 @@ impl GuiApp {
     pub(crate) fn overview(&mut self, ui: &mut egui::Ui) {
         page_header(
             ui,
-            "WORKSPACE / OVERVIEW",
             "Wallet overview",
-            "View your confirmed balance and receive MONAR.",
+            "Balances reflect your last validated chain scan.",
         );
 
         let balance = self.balance.clone();
@@ -236,125 +234,113 @@ impl GuiApp {
         let mut go_node = false;
         let mut stop = false;
 
-        card(ui, |ui| {
-            ui.label(theme::section("CONFIRMED BALANCE"));
-            ui.add_space(4.0);
+        theme::card(ui).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(theme::section("Confirmed balance"));
             if let Some(balance) = &balance {
-                ui.label(theme::amount(&format!(
-                    "{} MONAR",
-                    backend::format_monar(balance.total())
-                )));
-                ui.label(theme::caption(&format!(
-                    "transparent {} · private {}",
-                    backend::format_monar(balance.transparent),
-                    backend::format_monar(balance.private)
-                )));
+                ui.label(theme::amount(&format!("{} MONAR", backend::format_monar(balance.total()))));
+                ui.add_space(6.0);
+                ui.columns(2, |columns| {
+                    theme::inset(&columns[0]).show(&mut columns[0], |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(theme::caption("Transparent"));
+                        ui.label(theme::subtitle(&atom_text(balance.transparent)));
+                    });
+                    theme::inset(&columns[1]).show(&mut columns[1], |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(theme::caption("Private"));
+                        ui.label(theme::subtitle(&atom_text(balance.private)));
+                    });
+                });
                 if balance.immature > 0 {
-                    ui.label(theme::caption(&format!(
-                        "immature coinbase {}",
-                        backend::format_monar(balance.immature)
-                    )));
+                    theme::key_value(ui, "Mining rewards awaiting maturity", &atom_text(balance.immature));
                 }
-                ui.add_space(8.0);
-                theme::divider(ui);
-                theme::key_value(ui, "Validated tip", &GuiApp::short(&balance.tip));
-                theme::key_value(ui, "Height", &balance.height.to_string());
-                theme::key_value(
-                    ui,
-                    "Scan",
-                    if balance.full_chain_replay {
-                        "full replay"
-                    } else {
-                        "trusted checkpoint"
-                    },
-                );
                 if balance.pending > 0 {
                     theme::key_value(ui, "Pending reservations", &balance.pending.to_string());
                 }
+                ui.label(theme::caption(&format!(
+                    "Validated at block {} · {}",
+                    balance.height,
+                    GuiApp::short(&balance.tip)
+                )));
             } else {
-                ui.label(theme::amount("— MONAR"));
+                ui.label(theme::title("Balance unavailable"));
                 ui.label(theme::caption(if scan_configured {
                     "Refresh your balance to scan the configured chain."
                 } else {
-                    "Set up a chain source in Node to scan your balance."
+                    "Connect a validated chain source to see your balance. You can create receive addresses offline."
                 }));
             }
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if scan_configured {
-                    refresh = ui
-                        .add_enabled(!busy, theme::button_secondary("Refresh balance"))
-                        .clicked();
-                } else if ui
-                    .add(theme::button_secondary("Set up balance scanning"))
-                    .clicked()
-                {
-                    go_node = true;
-                }
-            });
+            ui.add_space(6.0);
+            if scan_configured {
+                refresh = ui.add_enabled(!busy, theme::button_secondary("Refresh balance")).clicked();
+            } else if ui.add(theme::button_secondary("Set up balance scanning")).clicked() {
+                go_node = true;
+            }
         });
-        card(ui, |ui| {
-            ui.label(theme::section("RECEIVE"));
-            ui.add_space(4.0);
-            if let Some(address) = &address {
-                ui.label(theme::caption("Latest address"));
-                ui.add(egui::Label::new(theme::mono(&address.address)).wrap());
-                ui.label(theme::caption(&format!(
-                    "{} · index {}",
-                    address.kind, address.index
-                )));
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
+        ui.add_space(12.0);
+
+        let mut receive = |ui: &mut egui::Ui| {
+            card(ui, |ui| {
+                ui.label(theme::section("Receive"));
+                if let Some(address) = &address {
+                    ui.label(theme::caption(if address.kind == "private" {
+                        "Latest private address"
+                    } else {
+                        "Latest transparent address"
+                    }));
+                    ui.add(egui::Label::new(theme::mono(&address.address)).wrap());
                     if ui.add(theme::button_secondary("Copy address")).clicked() {
                         copy = Some(address.address.clone());
                     }
-                    if ui
-                        .add_enabled(!busy, theme::button_secondary("New transparent address"))
-                        .clicked()
-                    {
-                        derive = true;
-                    }
-                });
-            } else {
-                ui.label(theme::caption(
-                    "Create a transparent address to receive MONAR.",
-                ));
-                ui.add_space(8.0);
-                if ui
-                    .add_enabled(!busy, theme::button_primary("New transparent address"))
-                    .clicked()
-                {
-                    derive = true;
+                } else {
+                    ui.label(theme::caption(
+                        "Create a transparent address to receive MONAR.",
+                    ));
                 }
-            }
-            ui.add_space(10.0);
-            theme::divider(ui);
-            ui.add_space(6.0);
-            ui.label(theme::section("NODE"));
-            ui.label(theme::caption(if node_running {
-                "Running from this wallet"
-            } else if self.state.node.is_some() {
-                "Identity configured, process stopped"
-            } else {
-                "No node identity configured"
-            }));
-            if let Some(status) = &self.node_status {
-                theme::key_value(ui, "Height", &status.height);
-                theme::key_value(ui, "Peers", &status.peers.to_string());
-            }
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
+                derive = ui
+                    .add_enabled(!busy, theme::button_primary("New transparent address"))
+                    .clicked();
+            });
+        };
+        let mut node = |ui: &mut egui::Ui| {
+            card(ui, |ui| {
+                ui.label(theme::section("Local node"));
+                ui.label(theme::subtitle(if node_running {
+                    "Running"
+                } else if self.state.node.is_some() {
+                    "Stopped"
+                } else {
+                    "Setup required"
+                }));
+                if let Some(status) = self.node_status.as_ref().filter(|_| node_running) {
+                    theme::key_value(ui, "Height", &status.height);
+                    theme::key_value(ui, "Peers", &status.peers.to_string());
+                } else {
+                    ui.label(theme::caption(
+                        "Manage the node and chain used by this wallet.",
+                    ));
+                }
                 if ui
                     .add(theme::button_secondary("Open node settings"))
                     .clicked()
                 {
                     go_node = true;
                 }
-                if node_running && ui.add(theme::button_danger("Stop node")).clicked() {
+                if node_running && ui.add(theme::button_danger(ui, "Stop node")).clicked() {
                     stop = true;
                 }
             });
-        });
+        };
+        if ui.available_width() >= 720.0 {
+            ui.columns(2, |columns| {
+                receive(&mut columns[0]);
+                node(&mut columns[1]);
+            });
+        } else {
+            receive(ui);
+            node(ui);
+        }
 
         if let Some(text) = copy {
             ui.ctx().copy_text(text);
@@ -388,9 +374,8 @@ impl GuiApp {
     pub(crate) fn send(&mut self, ui: &mut egui::Ui) {
         page_header(
             ui,
-            "WORKSPACE / SEND",
             "Send MONAR",
-            "Select transparent funds, enter a recipient and review the amount and fee before signing.",
+            "Send from transparent funds to a transparent or private address.",
         );
 
         let busy = self.is_busy();
@@ -401,10 +386,10 @@ impl GuiApp {
         let mut load = false;
         let mut sign = false;
 
-        card(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(theme::section("SPENDABLE FUNDS"));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let mut funding = |app: &mut Self, ui: &mut egui::Ui| {
+            card(ui, |ui| {
+                ui.label(theme::section("Spendable funds"));
+                ui.horizontal_wrapped(|ui| {
                     if scan_configured {
                         load = ui
                             .add_enabled(
@@ -416,172 +401,160 @@ impl GuiApp {
                         .add(theme::button_secondary("Set up chain source"))
                         .clicked()
                     {
-                        self.page = Page::Node;
+                        app.page = Page::Node;
                     }
                 });
-            });
-            if let Some(height) = inputs_height {
-                theme::key_value(ui, "Validated tip", &GuiApp::short(&self.inputs_tip));
-                theme::key_value(ui, "Height", &height.to_string());
-            } else {
-                ui.label(theme::caption(if scan_configured {
-                    "Scan the local chain to find funds available to spend."
+                if let Some(height) = inputs_height {
+                    theme::key_value(ui, "Validated tip", &GuiApp::short(&app.inputs_tip));
+                    theme::key_value(ui, "Height", &height.to_string());
                 } else {
-                    "Set up a chain source in Node before sending."
-                }));
-            }
-        });
+                    ui.label(theme::caption(if scan_configured {
+                        "Scan the local chain to find funds available to spend."
+                    } else {
+                        "Set up a chain source in Node before sending."
+                    }));
+                }
+            });
 
-        card(ui, |ui| {
-            ui.label(theme::section("SELECT TRANSPARENT OUTPUTS"));
-            ui.label(theme::caption(
+            card(ui, |ui| {
+                ui.label(theme::section("Select transparent outputs"));
+                ui.label(theme::caption(
                 "Select outputs that are mature and aren't already reserved by a signed transaction.",
             ));
-            ui.add_space(4.0);
-            if coins.is_empty() {
-                ui.label(theme::caption(if inputs_height.is_some() {
-                    "No unspent transparent outputs found."
+                ui.add_space(4.0);
+                if coins.is_empty() {
+                    ui.label(theme::caption(if inputs_height.is_some() {
+                        "No unspent transparent outputs found."
+                    } else {
+                        "Outputs appear here after scanning."
+                    }));
                 } else {
-                    "Outputs appear here after scanning."
-                }));
-            } else {
-                egui::ScrollArea::vertical()
-                    .max_height(190.0)
-                    .show(ui, |ui| {
-                        for coin in &coins {
-                            let key = (coin.transaction.clone(), coin.index);
-                            let mut selected = self.send_coins.contains(&key);
-                            ui.horizontal(|ui| {
-                                if ui
-                                    .add_enabled(
-                                        coin.selectable(),
-                                        egui::Checkbox::without_text(&mut selected),
-                                    )
-                                    .changed()
-                                {
-                                    if selected {
-                                        self.send_coins.insert(key.clone());
-                                    } else {
-                                        self.send_coins.remove(&key);
+                    egui::ScrollArea::vertical()
+                        .max_height(190.0)
+                        .show(ui, |ui| {
+                            for coin in &coins {
+                                let key = (coin.transaction.clone(), coin.index);
+                                let mut selected = app.send_coins.contains(&key);
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui
+                                        .add_enabled(
+                                            coin.selectable(),
+                                            egui::Checkbox::without_text(&mut selected),
+                                        )
+                                        .changed()
+                                    {
+                                        if selected {
+                                            app.send_coins.insert(key.clone());
+                                        } else {
+                                            app.send_coins.remove(&key);
+                                        }
                                     }
-                                }
-                                ui.label(theme::mono(&GuiApp::short(&coin.transaction)));
-                                ui.label(theme::caption(&format!("#{}", coin.index)));
-                                let note = if !coin.mature_next_block {
-                                    "immature"
-                                } else if coin.reserved {
-                                    "reserved"
-                                } else {
-                                    "spendable"
-                                };
-                                ui.label(theme::caption(note));
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        ui.label(theme::mono(&atom_text(coin.atoms)));
-                                    },
-                                );
-                            });
-                        }
+                                    ui.label(theme::mono(&GuiApp::short(&coin.transaction)));
+                                    ui.label(theme::caption(&format!("#{}", coin.index)));
+                                    let note = if !coin.mature_next_block {
+                                        "immature"
+                                    } else if coin.reserved {
+                                        "reserved"
+                                    } else {
+                                        "spendable"
+                                    };
+                                    ui.label(theme::caption(note));
+                                    ui.label(theme::mono(&atom_text(coin.atoms)));
+                                });
+                            }
+                        });
+                }
+            });
+        };
+        let mut payment = |app: &mut Self, ui: &mut egui::Ui| {
+            let balance_atoms: u64 = app
+                .selected_coins(&coins, &app.send_coins)
+                .iter()
+                .map(|coin| coin.atoms)
+                .sum();
+            card(ui, |ui| {
+                ui.label(theme::section("Payment details"));
+                ui.add_space(4.0);
+                ui.label(theme::caption("Recipient address"));
+                let (transparent, private) = match app.form_network {
+                    Network::Main => ("mont1", "monz1"),
+                    Network::Test => ("testmont1", "testmonz1"),
+                    Network::Regtest => ("rmont1", "rmonz1"),
+                };
+                theme::field(
+                    ui,
+                    &mut app.send_address,
+                    &format!("{transparent}… or {private}…"),
+                );
+                let recipient = app.send_address.trim();
+                if recipient.starts_with(transparent) {
+                    ui.label(theme::caption(
+                        "The recipient address and amount are public.",
+                    ));
+                } else if recipient.starts_with(private) {
+                    ui.label(theme::caption(
+                        "Private address format. The selected transparent inputs remain public.",
+                    ));
+                }
+                ui.add_space(4.0);
+                ui.columns(2, |columns| {
+                    columns[0].label(theme::caption("Amount (MONAR)"));
+                    theme::field(&mut columns[0], &mut app.send_amount, "0.0");
+                    columns[1].label(theme::caption("Fee (MONAR)"));
+                    theme::field(&mut columns[1], &mut app.send_fee, "0.001");
+                });
+                egui::CollapsingHeader::new("Advanced transaction settings").show(ui, |ui| {
+                    ui.add_space(4.0);
+                    ui.columns(3, |columns| {
+                        columns[0].label(theme::caption("Max fee (MONAR)"));
+                        theme::field(&mut columns[0], &mut app.send_max_fee, "0.01");
+                        columns[1].label(theme::caption("Expires after (blocks)"));
+                        theme::field(&mut columns[1], &mut app.send_expiry, "20");
+                        columns[2].label(theme::caption("Change"));
+                        columns[2].checkbox(&mut app.state.send_change_private, "Private change");
                     });
-            }
-        });
-
-        let balance_atoms: u64 = self
-            .selected_coins(&coins, &self.send_coins)
-            .iter()
-            .map(|coin| coin.atoms)
-            .sum();
-        card(ui, |ui| {
-            ui.label(theme::section("PAYMENT"));
-            ui.add_space(4.0);
-            ui.label(theme::caption("Recipient address"));
-            let hint = match self.form_network {
-                Network::Main => "mont1… or monz1…",
-                Network::Test => "testmont1… or testmonz1…",
-                Network::Regtest => "rmont1… or rmonz1…",
-            };
-            theme::field(ui, &mut self.send_address, hint);
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                let half = (ui.available_width() - 10.0) * 0.5;
-                ui.allocate_ui_with_layout(
-                    Vec2::new(half, ui.available_height()),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        ui.label(theme::caption("Amount (MONAR)"));
-                        theme::field(ui, &mut self.send_amount, "0.0");
-                    },
+                });
+                theme::divider(ui);
+                ui.add_space(6.0);
+                theme::key_value(
+                    ui,
+                    "Selected value",
+                    &format!("{} MONAR", backend::format_monar(balance_atoms)),
                 );
-                ui.add_space(10.0);
-                ui.allocate_ui_with_layout(
-                    Vec2::new(half, ui.available_height()),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        ui.label(theme::caption("Fee (MONAR)"));
-                        theme::field(ui, &mut self.send_fee, "0.001");
-                    },
+                ui.add_space(8.0);
+                ui.checkbox(
+                    &mut app.confirm_reserve,
+                    "Reserve the selected inputs when signing",
                 );
-            });
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                let third = (ui.available_width() - 20.0) / 3.0;
-                ui.allocate_ui_with_layout(
-                    Vec2::new(third, ui.available_height()),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        ui.label(theme::caption("Max fee (MONAR)"));
-                        theme::field(ui, &mut self.send_max_fee, "0.01");
-                    },
-                );
-                ui.add_space(10.0);
-                ui.allocate_ui_with_layout(
-                    Vec2::new(third, ui.available_height()),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        ui.label(theme::caption("Expiry delta (blocks)"));
-                        theme::field(ui, &mut self.send_expiry, "20");
-                    },
-                );
-                ui.add_space(10.0);
-                ui.allocate_ui_with_layout(
-                    Vec2::new(third, ui.available_height()),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        ui.label(theme::caption("Change"));
-                        ui.checkbox(&mut self.state.send_change_private, "Private change");
-                    },
-                );
-            });
-            ui.add_space(6.0);
-            theme::key_value(
-                ui,
-                "Selected value",
-                &format!("{} MONAR", backend::format_monar(balance_atoms)),
-            );
-            ui.add_space(8.0);
-            ui.checkbox(
-                &mut self.confirm_reserve,
-                "I understand signing reserves the selected inputs and is not reversible here.",
-            );
-            ui.add_space(6.0);
-            if ui
+                ui.add_space(6.0);
+                if ui
                 .add_enabled(
                     !busy
                         && scan_configured
                         && inputs_height.is_some()
-                        && self.confirm_reserve
+                        && app.confirm_reserve
                         && balance_atoms > 0,
                     theme::button_primary("Sign transaction"),
                 )
+                .on_disabled_hover_text("Scan for funds, select outputs, and confirm input reservation before signing.")
                 .clicked()
             {
                 sign = true;
             }
-        });
+            });
+        };
+        if ui.available_width() >= 780.0 {
+            ui.columns(2, |columns| {
+                funding(self, &mut columns[1]);
+                payment(self, &mut columns[0]);
+            });
+        } else {
+            funding(self, ui);
+            payment(self, ui);
+        }
 
-        card(ui, |ui| {
-            ui.label(theme::section("FEE ESTIMATOR"));
+        egui::CollapsingHeader::new("Fee estimator").show(ui, |ui| {
+            card(ui, |ui| {
             ui.label(theme::caption(
                 "Historical fee samples from the active validated branch. This is a heuristic, not mempool policy or an inclusion guarantee.",
             ));
@@ -655,6 +628,7 @@ impl GuiApp {
                 theme::key_value(ui, "P75 atoms/KB", &text("p75_atoms_per_kb"));
                 theme::key_value(ui, "Suggested atoms", &text("suggested_fee_atoms"));
             }
+            });
         });
 
         if let Some(construct) = &construct {
@@ -723,7 +697,6 @@ impl GuiApp {
     pub(crate) fn receive(&mut self, ui: &mut egui::Ui) {
         page_header(
             ui,
-            "WORKSPACE / RECEIVE",
             "Receive MONAR",
             "Create a transparent or private address to share with the sender.",
         );
@@ -788,250 +761,207 @@ impl GuiApp {
         }
     }
 
-    fn cached_mining_worker_limit(ui: &egui::Ui) -> u8 {
-        let id = egui::Id::new("mining-worker-limit");
-        let now = std::time::Instant::now();
-        ui.ctx().memory_mut(|memory| {
-            if let Some((stamp, limit)) = memory.data.get_temp::<(std::time::Instant, u8)>(id) {
-                if now.saturating_duration_since(stamp) < std::time::Duration::from_secs(1) {
-                    return limit;
-                }
-            }
-            let limit = monario_randomx::mining_worker_limit();
-            memory.data.insert_temp(id, (now, limit));
-            limit
-        })
-    }
-
     pub(crate) fn mining(&mut self, ui: &mut egui::Ui) {
-        let worker_limit = Self::cached_mining_worker_limit(ui);
-        page_header(
-            ui,
-            "WORKSPACE / MINING",
-            "Mine MONAR",
-            "Choose solo or pool mining. RandomX uses a shared 256 MiB cache plus a 2 MiB scratchpad per worker.",
-        );
+        page_header(ui, "Mining", "Mine MONAR with your CPU.");
+        let interval = std::time::Duration::from_secs(2);
+        if self.last_worker_probe.elapsed() >= interval {
+            self.worker_limit = monario_randomx::mining_worker_limit();
+            self.last_worker_probe = std::time::Instant::now();
+        }
+        ui.ctx().request_repaint_after(interval);
         let busy = self.is_busy();
         let running = self.node_kind == Some(NodeKind::Mine);
         let node_ready = self.state.node.is_some() && !self.node_manifest.trim().is_empty();
         let mut start = false;
         let mut stop = false;
 
-        card(ui, |ui| {
-            ui.label(theme::section("MINER CONFIGURATION"));
-            ui.add_space(4.0);
-            ui.label(theme::caption("Miner address (public coinbase recipient)"));
-            let prefix = match self.form_network {
-                Network::Main => "mont1…",
-                Network::Test => "testmont1…",
-                Network::Regtest => "rmont1…",
-            };
-            theme::field(ui, &mut self.state.mining_address, prefix);
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.add_enabled(
-                    worker_limit > 0,
-                    egui::Slider::new(&mut self.state.mining_workers, 1..=worker_limit.max(1))
-                        .text("workers")
-                        .clamping(egui::SliderClamping::Edits),
-                );
-                ui.add_space(10.0);
-                ui.label(theme::caption(&format!(
-                    "≈ 256 MiB shared cache + {} MiB scratchpad",
-                    u32::from(self.state.mining_workers) * 2
-                )));
-            });
-            if worker_limit == 0 {
-                ui.label(theme::caption(
-                    "Insufficient available memory to mine. Free memory and try again.",
-                ));
-            } else if self.state.mining_workers > worker_limit {
-                ui.label(theme::caption(&format!(
-                    "Configured {} workers is above the current maximum of {worker_limit}.",
-                    self.state.mining_workers
-                )));
-            }
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label(theme::caption("Miner network"));
-                ui.label(self.form_network.label());
-                ui.add_space(12.0);
-                ui.checkbox(
-                    &mut self.state.mining_network_enabled,
-                    "Connect to blockchain peers",
-                );
-            });
-            ui.label(theme::caption(
-                "Without the peer-network checkbox the node runs a local-only loop and binds nothing.",
-            ));
-            ui.add_space(12.0);
-            ui.label(theme::section("MINING SOURCE"));
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                for option in PoolMode::ALL {
-                    ui.radio_value(&mut self.state.mining_pool_mode, option, option.label());
-                }
-            });
-            ui.add_space(4.0);
-            match self.state.mining_pool_mode {
-                PoolMode::Solo => {
-                    ui.label(theme::caption(
-                        "Solo: search on your own validated node. It never creates genesis or a new database.",
-                    ));
-                }
-                PoolMode::Official => {
-                    ui.label(theme::caption(&format!(
-                        "Preset endpoint: {}. Confirm availability and obtain credentials from the pool operator.",
-                        backend::OFFICIAL_POOL_ADDRESS
-                    )));
-                }
-                PoolMode::Custom => {
-                    ui.label(theme::caption("Pool endpoint (HOST:PORT)"));
-                    theme::field(
-                        ui,
-                        &mut self.state.mining_pool_address,
-                        "pool.example.org:19444",
-                    );
-                    ui.add_space(4.0);
-                }
-            }
-            if self.state.mining_pool_mode != PoolMode::Solo {
-                ui.label(theme::caption("Pool public key (64 lowercase hex)"));
-                theme::field(ui, &mut self.state.mining_pool_public_key, "…");
-                ui.add_space(4.0);
-                ui.label(theme::caption("Pool client id (32 lowercase hex)"));
-                theme::field(ui, &mut self.state.mining_pool_client, "…");
-                ui.add_space(4.0);
-                ui.label(theme::caption(
-                    "Token file name under the node directory (must end with .token)",
-                ));
-                theme::field(ui, &mut self.state.mining_pool_token_file, "pool.token");
-                ui.label(theme::caption(
-                    "Create the private .token file yourself (64 lowercase hex, no group/other access on Unix). This app never stores or passes the token value in arguments.",
-                ));
-                ui.add_space(4.0);
-                ui.label(theme::caption(
-                    "Confirm the pool's public key with the operator. Pool shares are tracked separately from wallet payments.",
-                ));
-            }
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        !busy
-                            && self.node.is_none()
-                            && node_ready
-                            && !self.state.mining_address.trim().is_empty()
-                            && self.state.mining_workers <= worker_limit,
-                        theme::button_primary("Start mining"),
+        let width = ui.available_width();
+        let mut render = |ui: &mut egui::Ui| {
+            let mut setup = |ui: &mut egui::Ui| {
+                card(ui, |ui| {
+                    ui.label(theme::section("Mining mode"));
+                    ui.horizontal_wrapped(|ui| {
+                        for option in PoolMode::ALL {
+                            let label = option.label();
+                            if theme::choice(
+                                ui,
+                                label,
+                                label,
+                                self.state.mining_pool_mode == option,
+                            )
+                            .clicked()
+                                && self.state.mining_pool_mode != option
+                            {
+                                self.pool_credential.zeroize();
+                                self.state.mining_pool_mode = option;
+                            }
+                        }
+                    });
+                    if self.state.mining_pool_mode == PoolMode::Custom {
+                        ui.horizontal_top(|ui| {
+                            let width = ui.available_width();
+                            let gap = ui.spacing().item_spacing.x;
+                            let port_width = 106.0;
+                            ui.allocate_ui_with_layout(
+                                Vec2::new((width - port_width - gap).max(0.0), 0.0),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    ui.label(theme::caption("Pool host or IP"));
+                                    theme::field(
+                                        ui,
+                                        &mut self.state.mining_pool_address,
+                                        "pool.example.org",
+                                    );
+                                },
+                            );
+                            ui.vertical(|ui| {
+                                ui.label(theme::caption("Port"));
+                                theme::field(ui, &mut self.state.mining_pool_port, "19444");
+                            });
+                        });
+                        ui.label(theme::caption("Pool credential"));
+                        let credential = theme::password_field(
+                            ui,
+                            &mut self.pool_credential,
+                            "Paste the credential from your pool",
+                        );
+                        if let Some(mut editor) =
+                            egui::TextEdit::load_state(ui.ctx(), credential.id)
+                        {
+                            editor.clear_undoer();
+                            egui::TextEdit::store_state(ui.ctx(), credential.id, editor);
+                        }
+                        ui.label(theme::caption(
+                            "Ask your Monario pool operator for the credential and register your payout address with them.",
+                        ));
+                    } else {
+                        ui.label(theme::caption(
+                            "Use your own validated node to search for blocks.",
+                        ));
+                    }
+                    ui.add_space(8.0);
+                    theme::divider(ui);
+                    ui.add_space(5.0);
+                    if self.state.mining_pool_mode == PoolMode::Solo {
+                        ui.label(theme::section("Payout address"));
+                        let prefix = match self.form_network {
+                            Network::Main => "mont1…",
+                            Network::Test => "testmont1…",
+                            Network::Regtest => "rmont1…",
+                        };
+                        theme::field(ui, &mut self.state.mining_address, prefix);
+                        ui.label(theme::caption("Mining rewards use a transparent address."));
+                        ui.add_space(8.0);
+                    }
+                    ui.label(theme::section("CPU workers"));
+                    let limit = self.worker_limit;
+                    ui.add_enabled_ui(!running && limit > 0, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            egui::ComboBox::from_id_salt("mining-worker-count")
+                                .selected_text(self.state.mining_workers.to_string())
+                                .height(260.0)
+                                .show_ui(ui, |ui| {
+                                    for workers in 1..=limit {
+                                        ui.selectable_value(
+                                            &mut self.state.mining_workers,
+                                            workers,
+                                            workers.to_string(),
+                                        );
+                                    }
+                                });
+                            if limit > 1 && ui.add(theme::button_secondary("Use maximum")).clicked()
+                            {
+                                self.state.mining_workers = limit;
+                            }
+                        });
+                    });
+                    if limit == 0 {
+                        ui.label(theme::caption(
+                            "There is insufficient available memory to start mining.",
+                        ));
+                    } else {
+                        ui.label(theme::caption(&format!(
+                            "Up to {limit} on this device · 256 MiB shared cache + {} MiB scratchpads",
+                            u32::from(self.state.mining_workers) * 2
+                        )));
+                    }
+                    let pool_ready = self.state.mining_pool_mode == PoolMode::Solo
+                        || (!self.pool_credential.is_empty()
+                            && !self.state.mining_pool_address.trim().is_empty()
+                            && !self.state.mining_pool_port.trim().is_empty());
+                    ui.checkbox(
+                        &mut self.state.mining_network_enabled,
+                        "Connect to blockchain peers",
                     )
-                    .clicked()
-                {
-                    start = true;
-                }
-                if ui
-                    .add_enabled(!busy && running, theme::button_danger("Stop"))
-                    .clicked()
-                {
-                    stop = true;
-                }
-            });
-            if self.state.mining_address.trim().is_empty() {
-                ui.label(theme::caption(
-                    "Enter a miner address first. The coinbase pays that transparent address.",
-                ));
-            }
-            if !node_ready {
-                ui.label(theme::caption(
-                    "Configure a node identity and chain manifest in Node before mining.",
-                ));
-            } else if self.node.is_some() && !running {
-                ui.label(theme::caption(
-                    "Stop the running node before starting the miner.",
-                ));
-            }
-        });
+                    .on_hover_text(if self.state.mining_pool_mode == PoolMode::Custom {
+                        "Custom pool always connects to your pool. This option also connects your node to blockchain peers."
+                    } else {
+                        "Leave unchecked to run the node locally without a peer listener."
+                    });
+                    ui.add_space(8.0);
+                    theme::divider(ui);
+                    ui.add_space(4.0);
+                    if running {
+                        stop = ui
+                            .add_enabled(!busy, theme::button_danger(ui, "Stop mining"))
+                            .clicked();
+                    } else {
+                        start = ui
+                            .add_enabled(
+                                !busy
+                                    && self.node.is_none()
+                                    && node_ready
+                                    && pool_ready
+                                    && (1..=limit).contains(&self.state.mining_workers)
+                                    && (self.state.mining_pool_mode == PoolMode::Custom
+                                        || !self.state.mining_address.trim().is_empty()),
+                                theme::button_primary("Start mining"),
+                            )
+                            .clicked();
+                    }
+                    if !node_ready {
+                        ui.label(theme::caption(
+                            "Set up the node identity and chain manifest in Node.",
+                        ));
+                    } else if self.state.mining_pool_mode == PoolMode::Solo
+                        && self.state.mining_address.trim().is_empty()
+                    {
+                        ui.label(theme::caption("Enter a payout address to start mining."));
+                    } else if !pool_ready {
+                        ui.label(theme::caption("Enter the pool host, port, and credential."));
+                    } else if limit > 0
+                        && !(1..=limit).contains(&self.state.mining_workers)
+                        && !running
+                    {
+                        ui.label(theme::caption(
+                            "Select a worker count within the current limit.",
+                        ));
+                    } else if self.node.is_some() && !running {
+                        ui.label(theme::caption(
+                            "Stop the running node before starting the miner.",
+                        ));
+                    }
+                })
+            };
 
-        card(ui, |ui| {
-            ui.label(theme::section("LIVE MINING STATUS"));
-            ui.add_space(4.0);
-            match &self.node_status {
-                Some(status) => {
-                    match &status.mining {
-                        Some(mining) => {
-                            theme::key_value(
-                                ui,
-                                "Workers",
-                                &format!("{} / {}", mining.workers, self.state.mining_workers),
-                            );
-                            theme::key_value(
-                                ui,
-                                "Job refreshed",
-                                if mining.refreshed { "yes" } else { "waiting" },
-                            );
-                            theme::key_value(
-                                ui,
-                                "Job id",
-                                &mining
-                                    .job
-                                    .as_deref()
-                                    .map(GuiApp::short)
-                                    .unwrap_or_else(|| "—".into()),
-                            );
-                            theme::key_value(
-                                ui,
-                                "Accepted",
-                                &mining
-                                    .accepted
-                                    .as_deref()
-                                    .map(GuiApp::short)
-                                    .unwrap_or_else(|| "—".into()),
-                            );
-                        }
-                        None => {
-                            ui.label(theme::caption("The node is running without mining."));
-                        }
-                    }
-                    if let Some(pool) = &status.pool {
-                        ui.add_space(6.0);
-                        theme::key_value(
-                            ui,
-                            "Pool connected",
-                            if pool.connected { "yes" } else { "no" },
-                        );
-                        theme::key_value(
-                            ui,
-                            "Pool assigned",
-                            if pool.assigned { "yes" } else { "no" },
-                        );
-                        theme::key_value(ui, "Shares submitted", &pool.submitted.to_string());
-                        theme::key_value(
-                            ui,
-                            "Block candidates",
-                            &pool.block_candidates.to_string(),
-                        );
-                    }
-                    if status.finality_warning {
-                        ui.add_space(6.0);
-                        ui.colored_label(
-                            theme::DANGER,
-                            "Finality warning: a warn-mode pinned block was left behind by a heavier branch. The node is following chainwork; this is local policy, not guaranteed finality.",
-                        );
-                    }
-                    theme::key_value(ui, "Height", &status.height);
-                    theme::key_value(ui, "Peers", &status.peers.to_string());
-                }
-                None => {
-                    ui.label(theme::caption(
-                        "No status snapshot yet. Start the node and wait for the first tick.",
-                    ));
-                }
+            if width >= 780.0 {
+                let gap = ui.spacing().item_spacing.x;
+                ui.allocate_ui_with_layout(
+                    egui::vec2(width * 0.63 - gap, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    setup,
+                );
+                ui.vertical(|ui| self.mining_status(ui, running));
+            } else {
+                setup(ui);
+                self.mining_status(ui, running);
             }
-            ui.add_space(6.0);
-            ui.label(theme::caption(
-                "Shares and accepted solutions are local observations, not payouts. Monario has no Stratum V2 compatibility claim.",
-            ));
-        });
+        };
+        if width >= 780.0 {
+            ui.horizontal_top(render);
+        } else {
+            render(ui);
+        }
 
         if start {
             self.start_node(NodeKind::Mine);
@@ -1041,10 +971,115 @@ impl GuiApp {
         }
     }
 
+    fn mining_status(&self, ui: &mut egui::Ui, running: bool) {
+        card(ui, |ui| {
+            ui.label(theme::section("Mining status"));
+            ui.horizontal(|ui| {
+                let palette = theme::palette(ui.ctx().theme());
+                let (dot, _) = ui.allocate_exact_size(egui::Vec2::splat(8.0), egui::Sense::hover());
+                ui.painter().circle_filled(
+                    dot.center(),
+                    4.0,
+                    if running {
+                        palette.success
+                    } else {
+                        palette.muted
+                    },
+                );
+                ui.label(theme::subtitle(if running {
+                    "Miner running"
+                } else {
+                    "Miner stopped"
+                }));
+            });
+            ui.label(theme::caption(self.form_network.label()));
+            if let Some(status) = &self.node_status {
+                ui.add_space(6.0);
+                theme::divider(ui);
+                match &status.mining {
+                    Some(mining) => {
+                        theme::key_value(
+                            ui,
+                            "Workers",
+                            &format!("{} / {}", mining.workers, self.state.mining_workers),
+                        );
+                        theme::key_value(
+                            ui,
+                            "Job refreshed",
+                            if mining.refreshed { "yes" } else { "waiting" },
+                        );
+                        theme::key_value(
+                            ui,
+                            "Job id",
+                            &mining
+                                .job
+                                .as_deref()
+                                .map(GuiApp::short)
+                                .unwrap_or_else(|| "—".into()),
+                        );
+                        theme::key_value(
+                            ui,
+                            "Accepted",
+                            &mining
+                                .accepted
+                                .as_deref()
+                                .map(GuiApp::short)
+                                .unwrap_or_else(|| "—".into()),
+                        );
+                    }
+                    None => {
+                        ui.label(theme::caption("The node is running without mining."));
+                    }
+                }
+                if let Some(pool) = &status.pool {
+                    ui.add_space(6.0);
+                    if pool.phase == Some(backend::PoolPhase::Rejected) {
+                        ui.colored_label(
+                            theme::palette(ui.ctx().theme()).danger,
+                            backend::POOL_AUTH_REJECTED,
+                        );
+                    } else {
+                        let connection = match pool.phase {
+                            Some(backend::PoolPhase::Authenticated) => "authenticated",
+                            Some(backend::PoolPhase::Authenticating) => "authenticating",
+                            Some(backend::PoolPhase::Handshake) => "handshaking",
+                            Some(backend::PoolPhase::Offline) => "offline",
+                            Some(backend::PoolPhase::Rejected) => "rejected",
+                            Some(backend::PoolPhase::Unknown) | None => {
+                                if pool.connected { "yes" } else { "no" }
+                            }
+                        };
+                        theme::key_value(ui, "Pool connection", connection);
+                        theme::key_value(
+                            ui,
+                            "Pool assigned",
+                            if pool.assigned { "yes" } else { "no" },
+                        );
+                    }
+                    theme::key_value(ui, "Shares submitted", &pool.submitted.to_string());
+                    theme::key_value(ui, "Block candidates", &pool.block_candidates.to_string());
+                }
+                if status.finality_warning {
+                    ui.add_space(6.0);
+                    ui.colored_label(
+                            theme::palette(ui.ctx().theme()).danger,
+                            "Finality warning: a warn-mode pinned block was left behind by a heavier branch. The node is following chainwork; this is local policy, not guaranteed finality.",
+                        );
+                }
+                theme::key_value(ui, "Height", &status.height);
+                theme::key_value(ui, "Peers", &status.peers.to_string());
+                if status.pool.is_some() {
+                    ui.label(theme::caption("Shares do not represent wallet payouts. Pools must use the Monario pool protocol."));
+                }
+            } else if running {
+                ui.label(theme::caption("Waiting for the first status update."));
+            }
+        });
+    }
+
     pub(crate) fn node(&mut self, ui: &mut egui::Ui) {
         page_header(
             ui,
-            "WORKSPACE / NODE",
             "Node settings",
             "Configure the chain used for wallet scans and manage your local node.",
         );
@@ -1314,7 +1349,7 @@ impl GuiApp {
                 ui.label(theme::section("RUNTIME"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
-                        .add_enabled(!busy && running, theme::button_danger("Stop node"))
+                        .add_enabled(!busy && running, theme::button_danger(ui, "Stop node"))
                         .clicked()
                     {
                         stop = true;
@@ -1433,7 +1468,6 @@ impl GuiApp {
     pub(crate) fn settings(&mut self, ui: &mut egui::Ui) {
         page_header(
             ui,
-            "WORKSPACE / SETTINGS",
             "Wallet settings",
             "Manage your saved wallet, password and encrypted backups.",
         );

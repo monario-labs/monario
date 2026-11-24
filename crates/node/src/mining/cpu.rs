@@ -40,7 +40,7 @@ pub struct Miner<'a> {
     prefix: [u8; 24],
 }
 impl<'a> Miner<'a> {
-    /// Inclusive range. Each worker owns a 256 MiB light cache; no dataset is allocated.
+    /// Inclusive range with a private light cache for standalone callers.
     pub fn new(
         work: &'a Work,
         start: u64,
@@ -55,7 +55,6 @@ impl<'a> Miner<'a> {
         Self::with_verifier(work, start, end, verifier)
     }
 
-    /// Reuse a caller-provided light cache, rejecting a verifier for another seed.
     pub(crate) fn with_verifier(
         work: &'a Work,
         start: u64,
@@ -105,7 +104,6 @@ impl<'a> Miner<'a> {
         Self::with_pool_verifier(work, start, end, prefix, share_target, verifier)
     }
 
-    /// Search a pool-assigned partition with a caller-provided light cache.
     pub(crate) fn with_pool_verifier(
         work: &'a Work,
         start: u64,

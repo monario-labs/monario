@@ -1,4 +1,4 @@
-use monario_randomx::{Error, MAX_INPUT_BYTES, Mode, Verifier};
+use monario_randomx::{Error, MAX_INPUT_BYTES, Mode, SharedCache, Verifier};
 
 fn hex(bytes: [u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -36,4 +36,36 @@ fn pinned_v2_vectors_and_lifecycle() {
             .unwrap()),
         "97024134686ce27d362ea8d86d8ef16483ac272abdabd46ef13359400777fe5e"
     );
+}
+
+#[test]
+fn shared_cache_keeps_independent_vms_alive_across_threads() {
+    let cache = SharedCache::new(b"test key 000").unwrap();
+    let expected = "22ec6b861b3eb23686b2efbad69513c967ecfce80983df66c9c5b4fbfb4cdb6f";
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(7));
+    let threads: Vec<_> = (0..6)
+        .map(|index| {
+            let cache = cache.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let mode = if index % 2 == 0 {
+                    Mode::Interpreter
+                } else {
+                    Mode::SecureJit
+                };
+                let vm = cache.verifier(mode);
+                drop(cache);
+                barrier.wait();
+                let mut vm = vm.unwrap();
+                for _ in 0..2 {
+                    assert_eq!(hex(vm.hash(b"This is a test").unwrap()), expected);
+                }
+            })
+        })
+        .collect();
+    drop(cache);
+    barrier.wait();
+    for thread in threads {
+        thread.join().unwrap();
+    }
 }

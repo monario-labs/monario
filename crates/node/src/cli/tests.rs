@@ -196,6 +196,42 @@ fn arguments_fail_closed_without_secret_echo_or_implicit_network() {
 }
 
 #[test]
+fn mine_rejects_invalid_solo_payout_address_before_activation() {
+    const REGTEST: &str = "rmont1qyqqqqgzqvzq2ps8pqys5zcvp58q7yq3zgfs7grwe7";
+    const TEST: &str = "testmont1qyqqqqgzqvzq2ps8pqys5zcvp58q7yq3zgfsxp6xum";
+    const PRIVATE: &str =
+        "rmonz1qypgluecd9cuke9cuaufjzxa367hm6f2drjcdg6dhrl2nx006gqkltnkw5904elwjstyd09ey8n3q4";
+    let (dir, cp) = fixture();
+    for (address, network) in [
+        (REGTEST, "test"),
+        (TEST, "regtest"),
+        (PRIVATE, "regtest"),
+        ("rmont1fixture", "regtest"),
+        ("", "regtest"),
+    ] {
+        let mut mine = args("check", dir.path(), cp);
+        mine[0] = "mine".into();
+        mine.extend(
+            [
+                "--enable-mining",
+                "--miner-address",
+                address,
+                "--miner-workers",
+                "1",
+                "--miner-network",
+                network,
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        assert!(
+            Command::parse(mine.into_iter().map(OsString::from)).is_err(),
+            "{address} on {network}"
+        );
+    }
+}
+
+#[test]
 fn mining_is_explicit_bounded_and_never_implies_network_activation() {
     let (dir, cp) = fixture();
     let mut mine = args("check", dir.path(), cp);
@@ -204,7 +240,7 @@ fn mining_is_explicit_bounded_and_never_implies_network_activation() {
         [
             "--enable-mining",
             "--miner-address",
-            "rmont1fixture",
+            "rmont1qyqqqqgzqvzq2ps8pqys5zcvp58q7yq3zgfs7grwe7",
             "--miner-workers",
             "2",
             "--miner-network",
@@ -243,32 +279,6 @@ fn mining_is_explicit_bounded_and_never_implies_network_activation() {
         invalid[index] = workers.into();
         assert!(Command::parse(invalid.into_iter().map(OsString::from)).is_err());
     }
-    let mut automatic = mine.clone();
-    let index = automatic
-        .iter()
-        .position(|arg| arg == "--miner-workers")
-        .unwrap()
-        + 1;
-    automatic[index] = "auto".into();
-    match Command::parse(automatic.into_iter().map(OsString::from)) {
-        Ok(command) => {
-            let workers = command.mining.as_ref().unwrap().workers;
-            assert!((1..=monario_randomx::MAX_WORKERS).contains(&workers));
-        }
-        Err(Error::MiningCapacity) => {}
-        Err(error) => panic!("unexpected error parsing --miner-workers auto: {error:?}"),
-    }
-    let mut shared_maximum = mine.clone();
-    let index = shared_maximum
-        .iter()
-        .position(|arg| arg == "--miner-workers")
-        .unwrap()
-        + 1;
-    shared_maximum[index] = monario_randomx::MAX_WORKERS.to_string();
-    assert_eq!(
-        parse(shared_maximum).mining.as_ref().unwrap().workers,
-        monario_randomx::MAX_WORKERS
-    );
     for network in ["mainnet", "testnet", "Regtest", ""] {
         let mut invalid = mine.clone();
         let index = invalid
@@ -396,7 +406,7 @@ fn scan_server_is_explicit_and_bound_to_runtime() {
         [
             "--enable-mining",
             "--miner-address",
-            "rmont1fixture",
+            "rmont1qyqqqqgzqvzq2ps8pqys5zcvp58q7yq3zgfs7grwe7",
             "--miner-workers",
             "1",
             "--miner-network",
@@ -466,15 +476,41 @@ fn scan_server_is_explicit_and_bound_to_runtime() {
 }
 
 #[test]
+fn pool_credential_is_strict_and_preserves_the_pinned_identity() {
+    let key = "11".repeat(32);
+    let client = "22".repeat(16);
+    let token = "33".repeat(32);
+    let credential = format!("monp1:{key}:{client}:{token}");
+    let auth = pool_auth(credential.as_bytes()).unwrap();
+    assert_eq!(auth.public_key, [0x11; 32]);
+    assert_eq!(auth.client, [0x22; 16]);
+    assert_eq!(*auth.token, [0x33; 32]);
+    for invalid in [
+        format!("monp2:{key}:{client}:{token}"),
+        format!("monp1:{key}:{client}"),
+        format!("{credential}:extra"),
+        format!("{credential}\n"),
+        format!("monp1:{key}:{client}:{}", "00".repeat(32)),
+        format!("monp1:{}:{client}:{token}", "AB".repeat(32)),
+    ] {
+        assert!(matches!(
+            pool_auth(invalid.as_bytes()),
+            Err(Error::Credentials)
+        ));
+    }
+}
+
+#[test]
 fn pool_mode_is_explicit_bounded_and_has_no_silent_fallback() {
-    let (dir, cp) = fixture();
+    let dir = private_tempdir();
+    let cp = chain_fixture(dir.path());
     let mut base = args("check", dir.path(), cp);
     base[0] = "mine".into();
     base.extend(
         [
             "--enable-mining",
             "--miner-address",
-            "rmont1fixture",
+            "rmont1qyqqqqgzqvzq2ps8pqys5zcvp58q7yq3zgfs7grwe7",
             "--miner-workers",
             "2",
             "--miner-network",
@@ -484,45 +520,62 @@ fn pool_mode_is_explicit_bounded_and_has_no_silent_fallback() {
         .map(str::to_owned),
     );
 
+    let mut higher = base.clone();
+    let index = higher
+        .iter()
+        .position(|flag| flag == "--miner-workers")
+        .unwrap()
+        + 1;
+    higher[index] = "16".into();
+    assert_eq!(parse(higher).mining.unwrap().workers, 16);
+
     let key = "11".repeat(32);
     let client = "22".repeat(16);
 
-    // Official mode needs credentials but no address; the published host is used.
-    let mut official = base.clone();
-    official.extend(
+    let mut removed = base.clone();
+    removed.extend(["--pool-mode", "official"].map(str::to_owned));
+    assert!(Command::parse(removed.into_iter().map(OsString::from)).is_err());
+
+    let mut protected = base.clone();
+    let index = protected
+        .iter()
+        .position(|a| a == "--miner-address")
+        .unwrap();
+    protected.drain(index..index + 2);
+    protected.extend(
         [
             "--pool-mode",
-            "official",
-            "--pool-public-key",
-            &key,
-            "--pool-client",
-            &client,
-            "--pool-token-file",
-            "pool.token",
+            "custom",
+            "--pool-address",
+            "pool.example.org:19444",
+            "--pool-credential-stdin",
         ]
-        .into_iter()
         .map(str::to_owned),
     );
-    let command = parse(official.clone());
-    let pool = command.mining.as_ref().unwrap().pool.as_ref().unwrap();
-    assert_eq!(pool.address, OFFICIAL_POOL_ADDRESS);
-    assert_eq!(pool.client, [0x22; 16]);
-
-    // Any missing credential is rejected, never degraded to solo.
-    for missing in ["--pool-public-key", "--pool-client", "--pool-token-file"] {
-        let mut invalid = official.clone();
-        let index = invalid.iter().position(|a| a == missing).unwrap();
-        invalid.drain(index..index + 2);
-        assert!(Command::parse(invalid.into_iter().map(OsString::from)).is_err());
-    }
-    // Official mode never accepts an address override.
-    let mut override_address = official.clone();
-    override_address.extend(
-        ["--pool-address", "127.0.0.1:1234"]
-            .into_iter()
-            .map(str::to_owned),
+    assert!(matches!(
+        parse(protected.clone())
+            .mining
+            .unwrap()
+            .pool
+            .unwrap()
+            .credentials,
+        PoolCredentials::Stdin
+    ));
+    let mut output = Vec::new();
+    assert_eq!(
+        execute_with_pool(
+            parse(protected.clone()),
+            &mut Cursor::new(frame(OLD)),
+            &mut output,
+            &Arc::new(AtomicBool::new(false)),
+            |_| panic!("incomplete credentials installed signal handling"),
+            |_, _, _, _| panic!("incomplete credentials activated transport"),
+        ),
+        Err(Error::Credentials)
     );
-    assert!(Command::parse(override_address.into_iter().map(OsString::from)).is_err());
+    assert!(output.is_empty());
+    protected.extend(["--pool-client", &client].map(str::to_owned));
+    assert!(Command::parse(protected.into_iter().map(OsString::from)).is_err());
 
     // Custom requires a bounded HOST:PORT.
     let mut custom = base.clone();
@@ -597,7 +650,7 @@ fn finality_pin_is_explicit_and_only_for_runtime_activation() {
         [
             "--enable-mining",
             "--miner-address",
-            "rmont1fixture",
+            "rmont1qyqqqqgzqvzq2ps8pqys5zcvp58q7yq3zgfs7grwe7",
             "--miner-workers",
             "1",
             "--miner-network",

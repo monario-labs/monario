@@ -7,8 +7,10 @@ use crate::mining::cpu;
 use crate::mining::{Error as MiningError, Work};
 use crate::{Clock, Node};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, Mutex},
+};
 use zeroize::{Zeroize, Zeroizing};
 
 pub const MAX_CLIENTS: usize = 1_024;
@@ -142,15 +144,24 @@ impl RandomXChecker {
         work: &Work,
         client: &ClientPolicy,
         mode: monario_randomx::Mode,
+        cache: monario_randomx::SharedCache,
     ) -> Result<Self, PoolError> {
+        if cache.seed() != work.seed().as_slice() {
+            return Err(PoolError::Hash(monario_randomx::Error::InvalidSeed));
+        }
+        let verifier = cache.verifier(mode).map_err(PoolError::Hash)?;
+        // The cache and the VM must both report the seed this job was built for.
+        if verifier.seed() != work.seed().as_slice() {
+            return Err(PoolError::Hash(monario_randomx::Error::InvalidSeed));
+        }
         Ok(Self {
-            verifier: super::Verifier::new(
+            verifier: super::Verifier::new_with_verifier(
                 work,
                 client.prefix,
                 client.start,
                 client.end,
                 client.share_target,
-                mode,
+                verifier,
             )?,
         })
     }
@@ -171,13 +182,60 @@ pub trait CheckerFactory {
     fn create(&self, work: &Work, client: &ClientPolicy) -> Result<Box<dyn Checker>, PoolError>;
 }
 
+/// One immutable initialized cache per active seed. A seed change drops the
+/// previous registry reference; checkers that still own a clone keep their VM
+/// valid until the old assignment is retired.
+struct SeedSlot<C> {
+    active: Mutex<Option<(Vec<u8>, C)>>,
+}
+
+impl<C: Clone> SeedSlot<C> {
+    fn new() -> Self {
+        Self {
+            active: Mutex::new(None),
+        }
+    }
+
+    fn acquire(
+        &self,
+        seed: &[u8],
+        create: impl FnOnce(&[u8]) -> Result<C, PoolError>,
+    ) -> Result<C, PoolError> {
+        let mut slot = self.active.lock().map_err(|_| PoolError::Storage)?;
+        if let Some((held, cache)) = slot.as_ref()
+            && held.as_slice() == seed
+        {
+            return Ok(cache.clone());
+        }
+        *slot = None;
+        let cache = create(seed)?;
+        *slot = Some((seed.to_vec(), cache.clone()));
+        Ok(cache)
+    }
+}
+
 pub struct RandomXFactory {
     pub mode: monario_randomx::Mode,
+    cache: SeedSlot<monario_randomx::SharedCache>,
+}
+
+impl RandomXFactory {
+    pub fn new(mode: monario_randomx::Mode) -> Self {
+        Self {
+            mode,
+            cache: SeedSlot::new(),
+        }
+    }
 }
 
 impl CheckerFactory for RandomXFactory {
     fn create(&self, work: &Work, client: &ClientPolicy) -> Result<Box<dyn Checker>, PoolError> {
-        Ok(Box::new(RandomXChecker::new(work, client, self.mode)?))
+        let cache = self.cache.acquire(&work.seed(), |seed| {
+            monario_randomx::SharedCache::new(seed).map_err(PoolError::Hash)
+        })?;
+        Ok(Box::new(RandomXChecker::new(
+            work, client, self.mode, cache,
+        )?))
     }
 }
 
@@ -236,7 +294,7 @@ pub struct Server {
     work: Work,
     policy: Policy,
     clients: Vec<Arc<ClientPolicy>>,
-    factory: Box<dyn CheckerFactory>,
+    factory: Arc<dyn CheckerFactory>,
     limits: Limits,
     session: Option<[u8; 16]>,
     client_index: Option<usize>,
@@ -261,18 +319,20 @@ impl Server {
             work,
             policy,
             clients.into_iter().map(Arc::new).collect(),
-            factory,
+            Arc::from(factory),
             limits,
         )
     }
 
     /// Multiple connections can share the same non-secret policy objects. Tokens
     /// remain owned by the caller's `Arc<ClientPolicy>` and are zeroized on drop.
+    /// The checker factory is shared so one initialized RandomX cache serves every
+    /// authenticated connection on the active seed.
     pub fn shared(
         work: &Work,
         policy: Policy,
         clients: Vec<Arc<ClientPolicy>>,
-        factory: Box<dyn CheckerFactory>,
+        factory: Arc<dyn CheckerFactory>,
         limits: Limits,
     ) -> Result<Self, Error> {
         if clients.is_empty() || clients.len() > MAX_CLIENTS || !limits.valid() {
@@ -394,7 +454,8 @@ impl Server {
             return Ok(rejected(wire::STALE));
         }
         if clock.monotonic_ms > current.expires_ms {
-            self.assignment = None;
+            // Keep the assignment so `apply_work` can rotate its ID and resend
+            // the job. The client may already have discarded it after STALE.
             return Ok(rejected(wire::STALE));
         }
         let client = self.clients[index].client;
@@ -416,18 +477,83 @@ impl Server {
             .policy
             .units(share.block_candidate)
             .map_err(Error::Pool)?;
-        // Submit a block candidate first: if the process dies before the durable
-        // credit, a retry sees AlreadyKnown at the node and can credit then.
+        // A block candidate is journaled durably before the node call, then
+        // finalized only from the node's verified durable block index. A crash
+        // before acceptance leaves an unresolved row; a crash after acceptance
+        // is reconciled idempotently.
         if share.block_candidate {
+            let block_id = self
+                .work
+                .block_id(node.source(), nonce)
+                .map_err(|_| Error::Pool(PoolError::Storage))?;
+            let parent = self.work.parent();
+            // Reserve the exact candidate and its credit before any chain
+            // mutation. Capacity is refused here, before the node sees a block.
+            let pending = match ledger.reserve(
+                block_id,
+                parent,
+                &solution.job_id,
+                &solution.nonce,
+                client,
+                units,
+                true,
+            ) {
+                Ok(pending) => pending,
+                Err(ledger::Error::Duplicate) => return Ok(rejected(wire::DUPLICATE)),
+                Err(_) => return Ok(rejected(wire::BUSY)),
+            };
             let result = node.submit_solution(&self.work, &solution, clock);
-            self.assignment = None;
             match result {
-                Ok(_) => {}
+                Ok(crate::mining::Submitted::Accepted(accepted)) if accepted.id == block_id => {}
+                Ok(crate::mining::Submitted::AlreadyKnown(id)) if id == block_id => {}
+                Ok(_) => {
+                    // The node reported a different block; keep the reservation
+                    // unresolved rather than crediting unproven work.
+                    return Ok(rejected(wire::BUSY));
+                }
                 Err(cpu::Error::Submit(MiningError::Stale)) => {
+                    if cancel_reservation(ledger, &block_id).is_err() {
+                        return Ok(rejected(wire::BUSY));
+                    }
+                    self.assignment = None;
                     return Ok(rejected(wire::STALE));
                 }
-                Err(_) => return Ok(rejected(wire::INVALID)),
+                Err(cpu::Error::Submit(
+                    MiningError::Address | MiningError::Encoding | MiningError::Consensus(_),
+                )) => {
+                    if cancel_reservation(ledger, &block_id).is_err() {
+                        return Ok(rejected(wire::BUSY));
+                    }
+                    return Ok(rejected(wire::INVALID));
+                }
+                Err(cpu::Error::Submit(MiningError::Node(
+                    crate::Error::Protocol | crate::Error::Clock | crate::Error::Configuration,
+                ))) => {
+                    if cancel_reservation(ledger, &block_id).is_err() {
+                        return Ok(rejected(wire::BUSY));
+                    }
+                    return Ok(rejected(wire::INVALID));
+                }
+                // I/O, storage, pruned, selection and unknown failures may hide a
+                // committed block. Preserve the reservation for reconciliation.
+                Err(_) => return Ok(rejected(wire::BUSY)),
             }
+            let Some(acceptance) = confirmed_acceptance(node, &pending)? else {
+                return Ok(rejected(wire::BUSY));
+            };
+            // The node has durably accepted this exact candidate. Retire the
+            // solved assignment immediately, even if the separate credit still
+            // needs runtime reconciliation.
+            self.assignment = None;
+            if ledger.finalize(&acceptance).is_err() {
+                // The block is durable but the credit is not. Keep the journal row
+                // for reconciliation and fail closed for this submission.
+                return Ok(rejected(wire::BUSY));
+            }
+            return Ok(wire::Message::Accepted {
+                units,
+                block_candidate: true,
+            });
         }
         match ledger.credit(
             &solution.job_id,
@@ -458,8 +584,24 @@ impl Server {
         }
     }
 
-    /// The current job for the authenticated client, if the assignment is live.
+    /// The current job for the authenticated client, ignoring lease expiry.
+    /// Diagnostics/tests only: the TCP driver uses [`Server::job_at`] so expired
+    /// work is never sent.
     pub fn job(&self) -> Option<wire::Message> {
+        self.job_message()
+    }
+
+    /// Current job only while its assignment is unexpired. An expired lease must
+    /// be rotated by [`Server::apply_work`] before it is dispatched again.
+    pub fn job_at(&self, now_ms: u64) -> Option<wire::Message> {
+        let assignment = self.assignment?;
+        if now_ms > assignment.expires_ms {
+            return None;
+        }
+        self.job_message()
+    }
+
+    fn job_message(&self) -> Option<wire::Message> {
         let index = self.client_index?;
         let assignment = self.assignment?;
         let client = &self.clients[index];
@@ -473,6 +615,44 @@ impl Server {
             target: client.share_target,
             packet: self.work.encode().to_vec(),
         })
+    }
+
+    /// Reconcile one validated refresh with this connection. An unchanged, live
+    /// job keeps its work and assignment IDs and its checker. An expired
+    /// assignment is rotated to a fresh ID and must be redispatched, but it
+    /// reuses the checker and its initialized cache. A retired assignment (for
+    /// example after an accepted candidate) is never revived for the same work.
+    /// A genuinely different job retires the old assignment and builds a fresh
+    /// checker. Returns `true` only when the peer needs a new job message.
+    pub fn apply_work(&mut self, work: &Work, now_ms: u64) -> Result<bool, Error> {
+        if self.closed {
+            return Err(Error::Closed);
+        }
+        if work.id() != self.work.id() {
+            self.replace_work(work, now_ms)?;
+            return Ok(true);
+        }
+        let Some(index) = self.client_index else {
+            return Ok(false);
+        };
+        let Some(assignment) = self.assignment else {
+            // Solved and retired: same-work refresh must not resurrect it.
+            return Ok(false);
+        };
+        if now_ms < assignment.expires_ms {
+            return Ok(false);
+        }
+        // Expired outstanding lease: rotate the assignment ID so a client that
+        // discarded it after STALE can accept the resent job, but keep the
+        // checker and its cache because the work itself is unchanged.
+        self.epoch = self.epoch.checked_add(1).ok_or(Error::Configuration)?;
+        self.session = Some(session_id(
+            self.work.id(),
+            self.clients[index].client,
+            self.epoch,
+        ));
+        self.assignment = Some(self.assignment(index, now_ms));
+        Ok(true)
     }
 
     /// Replace the validated work on a tip/mempool change. The old assignment is
@@ -541,6 +721,9 @@ pub struct Client {
     quota: Quota,
     last_ms: Option<u64>,
     closed: bool,
+    /// Set only by a server credential rejection before any session existed. A
+    /// later job/share rejection never marks the credential invalid.
+    auth_rejected: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -568,6 +751,7 @@ impl Client {
             quota: Quota::new(),
             last_ms: None,
             closed: false,
+            auth_rejected: false,
         })
     }
 
@@ -643,6 +827,11 @@ impl Client {
                 if matches!(code, wire::STALE | wire::UNAUTHORIZED) {
                     self.assignment = None;
                     self.work = None;
+                }
+                // Only a rejection that arrives while no session exists can be a
+                // credential rejection; later share/job codes must not reset it.
+                if code == wire::UNAUTHORIZED && self.session.is_none() {
+                    self.auth_rejected = true;
                 }
                 Ok(Event::Rejected { code })
             }
@@ -727,6 +916,15 @@ impl Client {
         self.session
     }
 
+    pub fn is_authenticated(&self) -> bool {
+        self.session.is_some()
+    }
+
+    /// The server explicitly rejected this client credential.
+    pub fn auth_rejected(&self) -> bool {
+        self.auth_rejected
+    }
+
     pub fn is_closed(&self) -> bool {
         self.closed
     }
@@ -793,6 +991,90 @@ fn rejected_event(code: u8) -> Event {
     Event::Rejected { code }
 }
 
+/// A definite rejection may drop its journal row. Missing means there is nothing
+/// left to cancel; any other failure stays unresolved and fails closed upstream.
+fn cancel_reservation(
+    ledger: &mut ledger::Ledger,
+    block: &[u8; 32],
+) -> Result<(), ledger::Error> {
+    match ledger.cancel(block) {
+        Ok(()) | Err(ledger::Error::Missing) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Accept a candidate only from the node's durable block index: exact ID, exact
+/// parent and the parent's contextual height plus one. No proof returns `None`
+/// and must leave the reservation unresolved and uncredited.
+fn confirmed_acceptance(
+    node: &Node,
+    pending: &ledger::Pending,
+) -> Result<Option<ledger::Acceptance>, Error> {
+    let Some(info) = node
+        .source()
+        .block_info(&pending.block)
+        .map_err(|_| Error::Pool(PoolError::Storage))?
+    else {
+        return Ok(None);
+    };
+    if info.parent != Some(pending.parent) {
+        return Ok(None);
+    }
+    let Some(parent) = node
+        .source()
+        .block_info(&pending.parent)
+        .map_err(|_| Error::Pool(PoolError::Storage))?
+    else {
+        return Ok(None);
+    };
+    let Some(height) = parent.height.checked_add(1) else {
+        return Ok(None);
+    };
+    if info.height != height {
+        return Ok(None);
+    }
+    Ok(Some(ledger::Acceptance {
+        block: pending.block,
+        parent: pending.parent,
+        height,
+        commitment: info.commitment,
+    }))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reconciliation {
+    pub finalized: usize,
+    pub remaining: usize,
+}
+
+/// Reconcile every unresolved block-candidate reservation against the durable
+/// node block index before a pool accepts connections. Each exact, contextually
+/// valid acceptance is finalized idempotently. Any finalize failure fails closed
+/// so startup cannot silently drop or double-credit reserved work.
+pub fn reconcile_pending(
+    node: &Node,
+    ledger: &mut ledger::Ledger,
+) -> Result<Reconciliation, Error> {
+    let pending = ledger
+        .pending()
+        .map_err(|error| Error::Pool(PoolError::Ledger(error)))?;
+    let total = pending.len();
+    let mut finalized = 0usize;
+    for entry in pending {
+        let Some(acceptance) = confirmed_acceptance(node, &entry)? else {
+            continue;
+        };
+        ledger
+            .finalize(&acceptance)
+            .map_err(|error| Error::Pool(PoolError::Ledger(error)))?;
+        finalized += 1;
+    }
+    Ok(Reconciliation {
+        finalized,
+        remaining: total - finalized,
+    })
+}
+
 /// Fixed-digest checker for tests. It still applies the real partition, target,
 /// tip and durable-ledger checks; only RandomX hashing is replaced.
 #[cfg(test)]
@@ -835,9 +1117,24 @@ impl CheckerFactory for FixedFactory {
 }
 
 #[cfg(test)]
+struct CountingFactory {
+    digest: [u8; 32],
+    creates: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl CheckerFactory for CountingFactory {
+    fn create(&self, work: &Work, client: &ClientPolicy) -> Result<Box<dyn Checker>, PoolError> {
+        self.creates
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        FixedFactory { digest: self.digest }.create(work, client)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::{REAL, append, clock, node, private_tempdir};
+    use crate::tests::{REAL, append, clock, node, private_tempdir, root};
     use monario_address::{Address, Network, Receiver, TransparentReceiver};
 
     fn limits() -> Limits {
@@ -897,6 +1194,29 @@ mod tests {
 
     fn frame(message: &wire::Message) -> (wire::Message, usize) {
         (message.clone(), wire::encode(message).unwrap().len())
+    }
+
+    #[test]
+    fn seed_slot_reuses_one_allocation_per_seed_and_keeps_old_clone() {
+        let slot: SeedSlot<Arc<u8>> = SeedSlot::new();
+        let creates = std::sync::atomic::AtomicUsize::new(0);
+        let acquire = |seed: &[u8]| {
+            slot.acquire(seed, |_| {
+                let allocation =
+                    creates.fetch_add(1, std::sync::atomic::Ordering::SeqCst) as u8;
+                Ok::<_, PoolError>(Arc::new(allocation))
+            })
+        };
+        let first = acquire(b"first").unwrap();
+        let same = acquire(b"first").unwrap();
+        assert!(Arc::ptr_eq(&first, &same));
+        assert_eq!(creates.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let second = acquire(b"second").unwrap();
+        assert_eq!(creates.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(!Arc::ptr_eq(&first, &second));
+        // The superseded clone remains valid and still refers to its allocation.
+        assert_eq!(*first, 0);
+        assert_eq!(*second, 1);
     }
 
     #[test]
@@ -1030,6 +1350,58 @@ mod tests {
                 code: wire::UNAUTHORIZED
             }
         );
+    }
+
+    #[test]
+    fn client_distinguishes_credential_rejection_from_later_share_rejection() {
+        let (_node_dir, n) = node();
+        let mut rejected = Client::new([7; 16], [9; 32], limits()).unwrap();
+        assert!(!rejected.is_authenticated());
+        assert!(!rejected.auth_rejected());
+        let reply = wire::Message::Rejected {
+            code: wire::UNAUTHORIZED,
+        };
+        let bytes = wire::encode(&reply).unwrap().len();
+        assert_eq!(
+            rejected.handle(&n, reply, bytes, clock(1)).unwrap(),
+            Event::Rejected {
+                code: wire::UNAUTHORIZED
+            }
+        );
+        assert!(rejected.auth_rejected());
+        assert!(!rejected.is_authenticated());
+
+        let mut client = Client::new([7; 16], [9; 32], limits()).unwrap();
+        let reply = wire::Message::AuthOk { session: [1; 16] };
+        let bytes = wire::encode(&reply).unwrap().len();
+        assert_eq!(
+            client.handle(&n, reply, bytes, clock(1)).unwrap(),
+            Event::Authenticated
+        );
+        assert!(client.is_authenticated());
+        for (tick, code) in [
+            wire::INVALID,
+            wire::STALE,
+            wire::DUPLICATE,
+            wire::BUSY,
+            wire::UNAUTHORIZED,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let reply = wire::Message::Rejected { code };
+            let bytes = wire::encode(&reply).unwrap().len();
+            assert_eq!(
+                client
+                    .handle(&n, reply, bytes, clock(2 + tick as u64))
+                    .unwrap(),
+                Event::Rejected { code }
+            );
+            // A rejection after a live session is a job/share rejection, never
+            // an invalid credential, even for the UNAUTHORIZED code.
+            assert!(!client.auth_rejected());
+        }
+        assert!(client.is_authenticated());
     }
 
     #[test]
@@ -1383,7 +1755,7 @@ mod tests {
     }
 
     #[test]
-    fn block_candidate_is_submitted_before_a_failed_credit_fails_closed() {
+    fn capacity_refusal_precedes_block_submission() {
         let _serial = REAL.lock().unwrap();
         let dir = private_tempdir();
         let (_node_dir, mut n) = node();
@@ -1427,16 +1799,300 @@ mod tests {
         );
         assert_eq!(
             n.source().chain().unwrap().height(),
-            1,
-            "the block is submitted before the separate durable credit"
+            0,
+            "a failed durable reservation must not reach the node"
         );
+        assert_eq!(ledger.share_count().unwrap(), 1);
         assert_eq!(
-            ledger.share_count().unwrap(),
-            1,
-            "capacity rejected the new share without rolling back the block"
+            ledger.pending_count().unwrap(),
+            0,
+            "capacity refused the reservation without leaving a journal row"
         );
         drop(server);
         assert_eq!(ledger.share_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn pending_reservation_without_acceptance_survives_reopen_uncredited() {
+        let _serial = REAL.lock().unwrap();
+        let dir = private_tempdir();
+        let (_node_dir, n) = node();
+        let path = dir.path().join("pool.sqlite");
+        let mut ledger = ledger::Ledger::create(&path, [9; 32], ledger_limits()).unwrap();
+        ledger
+            .reserve([3; 32], root().id, &[1; 32], &[2; 32], [7; 16], 1, true)
+            .unwrap();
+        drop(ledger);
+        let mut reopened = ledger::Ledger::open(&path, [9; 32], ledger_limits()).unwrap();
+        assert_eq!(
+            reconcile_pending(&n, &mut reopened).unwrap(),
+            Reconciliation {
+                finalized: 0,
+                remaining: 1
+            }
+        );
+        assert_eq!(reopened.share_count().unwrap(), 0);
+        assert_eq!(reopened.total([7; 16]).unwrap(), 0);
+        assert_eq!(reopened.pending_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn reconcile_finalizes_one_exact_durable_acceptance_once() {
+        let _serial = REAL.lock().unwrap();
+        let dir = private_tempdir();
+        let (_node_dir, mut n) = node();
+        let accepted = append(&mut n, root().id, vec![], 0);
+        let info = n.source().block_info(&accepted).unwrap().unwrap();
+        let parent = info.parent.unwrap();
+        assert_eq!(info.height, 1);
+        let path = dir.path().join("pool.sqlite");
+        let mut ledger = ledger::Ledger::create(&path, [9; 32], ledger_limits()).unwrap();
+        ledger
+            .reserve(accepted, parent, &[1; 32], &[2; 32], [7; 16], 1, true)
+            .unwrap();
+        assert_eq!(ledger.share_count().unwrap(), 0);
+        drop(ledger);
+        let mut reopened = ledger::Ledger::open(&path, [9; 32], ledger_limits()).unwrap();
+        assert_eq!(
+            reconcile_pending(&n, &mut reopened).unwrap(),
+            Reconciliation {
+                finalized: 1,
+                remaining: 0
+            }
+        );
+        assert_eq!(reopened.total([7; 16]).unwrap(), 1);
+        assert_eq!(reopened.share_count().unwrap(), 1);
+        assert_eq!(reopened.pending_count().unwrap(), 0);
+        assert_eq!(
+            reconcile_pending(&n, &mut reopened).unwrap(),
+            Reconciliation {
+                finalized: 0,
+                remaining: 0
+            }
+        );
+        assert_eq!(reopened.total([7; 16]).unwrap(), 1);
+        assert_eq!(reopened.share_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn stale_or_unproven_pending_stays_uncredited() {
+        let _serial = REAL.lock().unwrap();
+        let dir = private_tempdir();
+        let (_node_dir, mut n) = node();
+        let accepted = append(&mut n, root().id, vec![], 0);
+        let path = dir.path().join("pool.sqlite");
+        let mut ledger = ledger::Ledger::create(&path, [9; 32], ledger_limits()).unwrap();
+        // Correct block ID, impossible parent.
+        ledger
+            .reserve(accepted, [9; 32], &[1; 32], &[2; 32], [7; 16], 1, true)
+            .unwrap();
+        // No durable block index entry at all.
+        ledger
+            .reserve([4; 32], root().id, &[3; 32], &[4; 32], [7; 16], 1, true)
+            .unwrap();
+        drop(ledger);
+        let mut reopened = ledger::Ledger::open(&path, [9; 32], ledger_limits()).unwrap();
+        assert_eq!(
+            reconcile_pending(&n, &mut reopened).unwrap(),
+            Reconciliation {
+                finalized: 0,
+                remaining: 2
+            }
+        );
+        assert_eq!(reopened.share_count().unwrap(), 0);
+        assert_eq!(reopened.total([7; 16]).unwrap(), 0);
+        assert_eq!(reopened.pending_count().unwrap(), 2);
+    }
+
+    fn assignment_of(job: &wire::Message) -> ([u8; 32], [u8; 32]) {
+        match job {
+            wire::Message::Job { assignment, job, .. } => (*assignment, *job),
+            _ => panic!("expected job"),
+        }
+    }
+
+    #[test]
+    fn unchanged_work_keeps_ids_and_checkers_and_renews_an_expired_lease() {
+        let _serial = REAL.lock().unwrap();
+        let dir = private_tempdir();
+        let (_node_dir, mut n) = node();
+        let mut ledger =
+            ledger::Ledger::create(&dir.path().join("pool.sqlite"), [9; 32], ledger_limits())
+                .unwrap();
+        let work = prepare(&mut n, 1105);
+        let client = ClientPolicy::new([7; 16], [9; 32], [3; 24], 1, 4, [255; 32]).unwrap();
+        let creates = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut server = Server::new(
+            &work,
+            policy(),
+            vec![client],
+            Box::new(CountingFactory {
+                digest: [255; 32],
+                creates: creates.clone(),
+            }),
+            Limits {
+                job_ttl_ms: 100,
+                ..limits()
+            },
+        )
+        .unwrap();
+        let auth = wire::Message::Auth {
+            client: [7; 16],
+            token: [9; 32],
+        };
+        let bytes = wire::encode(&auth).unwrap().len();
+        assert!(matches!(
+            server
+                .handle(&mut n, &mut ledger, auth, bytes, clock(10))
+                .unwrap(),
+            wire::Message::AuthOk { .. }
+        ));
+        assert_eq!(creates.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let (assignment, _) = assignment_of(&server.job().unwrap());
+
+        // Live unchanged work neither replaces the job nor builds another checker.
+        assert!(!server.apply_work(&work, 20).unwrap());
+        assert_eq!(creates.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(assignment_of(&server.job().unwrap()).0, assignment);
+
+        // The lease expires at 110; rotate the assignment ID and redispatch the
+        // same work, reusing the checker and its cache.
+        assert!(server.apply_work(&work, 110).unwrap());
+        assert_eq!(creates.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let (renewed, renewed_job) = assignment_of(&server.job().unwrap());
+        assert_ne!(renewed, assignment);
+        assert_eq!(renewed_job, work.id());
+
+        let mut nonce = [0u8; 32];
+        nonce[..8].copy_from_slice(&1u64.to_le_bytes());
+        nonce[8..].copy_from_slice(&[3; 24]);
+        let submit = wire::Message::Submit {
+            assignment: renewed,
+            job: work.id(),
+            nonce,
+        };
+        let bytes = wire::encode(&submit).unwrap().len();
+        assert_eq!(
+            server
+                .handle(&mut n, &mut ledger, submit, bytes, clock(150))
+                .unwrap(),
+            wire::Message::Accepted {
+                units: 1,
+                block_candidate: false
+            },
+            "the rotated lease accepts work after the original expiry"
+        );
+    }
+
+    #[test]
+    fn actual_work_change_replaces_assignment_and_checker_once() {
+        let _serial = REAL.lock().unwrap();
+        let dir = private_tempdir();
+        let (_node_dir, mut n) = node();
+        let mut ledger =
+            ledger::Ledger::create(&dir.path().join("pool.sqlite"), [9; 32], ledger_limits())
+                .unwrap();
+        let work = prepare(&mut n, 1105);
+        let client = ClientPolicy::new([7; 16], [9; 32], [3; 24], 1, 4, [255; 32]).unwrap();
+        let creates = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut server = Server::new(
+            &work,
+            policy(),
+            vec![client],
+            Box::new(CountingFactory {
+                digest: [255; 32],
+                creates: creates.clone(),
+            }),
+            limits(),
+        )
+        .unwrap();
+        let auth = wire::Message::Auth {
+            client: [7; 16],
+            token: [9; 32],
+        };
+        let bytes = wire::encode(&auth).unwrap().len();
+        assert!(matches!(
+            server
+                .handle(&mut n, &mut ledger, auth, bytes, clock(10))
+                .unwrap(),
+            wire::Message::AuthOk { .. }
+        ));
+        let (first_assignment, first_job) = assignment_of(&server.job().unwrap());
+        assert_eq!(first_job, work.id());
+
+        let next = prepare_at(&mut n, 1210, 20);
+        assert_ne!(next.id(), work.id());
+        assert!(server.apply_work(&next, 20).unwrap());
+        assert_eq!(creates.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let (next_assignment, next_job) = assignment_of(&server.job().unwrap());
+        assert_ne!(next_assignment, first_assignment);
+        assert_eq!(next_job, next.id());
+
+        // The replacement is stable across later unchanged polls.
+        assert!(!server.apply_work(&next, 30).unwrap());
+        assert_eq!(creates.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(assignment_of(&server.job().unwrap()).0, next_assignment);
+    }
+
+    #[test]
+    fn accepted_candidate_does_not_revive_a_same_work_assignment() {
+        let _serial = REAL.lock().unwrap();
+        let dir = private_tempdir();
+        let (_node_dir, mut n) = node();
+        let mut ledger =
+            ledger::Ledger::create(&dir.path().join("pool.sqlite"), [9; 32], ledger_limits())
+                .unwrap();
+        let work = prepare(&mut n, 1105);
+        let client = ClientPolicy::new([7; 16], [9; 32], [3; 24], 1, 4, [255; 32]).unwrap();
+        let creates = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut server = Server::new(
+            &work,
+            policy(),
+            vec![client],
+            Box::new(CountingFactory {
+                digest: [0; 32],
+                creates: creates.clone(),
+            }),
+            limits(),
+        )
+        .unwrap();
+        let auth = wire::Message::Auth {
+            client: [7; 16],
+            token: [9; 32],
+        };
+        let bytes = wire::encode(&auth).unwrap().len();
+        assert!(matches!(
+            server
+                .handle(&mut n, &mut ledger, auth, bytes, clock(10))
+                .unwrap(),
+            wire::Message::AuthOk { .. }
+        ));
+        let (assignment, _) = assignment_of(&server.job().unwrap());
+        let mut nonce = [0u8; 32];
+        nonce[..8].copy_from_slice(&1u64.to_le_bytes());
+        nonce[8..].copy_from_slice(&[3; 24]);
+        let submit = wire::Message::Submit {
+            assignment,
+            job: work.id(),
+            nonce,
+        };
+        let bytes = wire::encode(&submit).unwrap().len();
+        assert_eq!(
+            server
+                .handle(&mut n, &mut ledger, submit, bytes, clock(11))
+                .unwrap(),
+            wire::Message::Accepted {
+                units: 5,
+                block_candidate: true
+            }
+        );
+        assert!(server.job().is_none());
+        assert!(!server.apply_work(&work, 500).unwrap());
+        assert_eq!(creates.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            server.job().is_none(),
+            "an accepted candidate must not resurrect the same-work assignment"
+        );
     }
 
     #[test]

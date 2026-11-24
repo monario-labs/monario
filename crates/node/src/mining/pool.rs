@@ -206,10 +206,33 @@ impl Verifier {
         target: [u8; 32],
         mode: monario_randomx::Mode,
     ) -> Result<Self, Error> {
+        let cache = monario_randomx::SharedCache::new(&work.seed()).map_err(Error::Hash)?;
+        Self::new_with_verifier(
+            work,
+            prefix,
+            start,
+            end,
+            target,
+            cache.verifier(mode).map_err(Error::Hash)?,
+        )
+    }
+
+    /// Bind an already initialized, seed-verified VM to one assignment.
+    pub(crate) fn new_with_verifier(
+        work: &Work,
+        prefix: [u8; 24],
+        start: u64,
+        end: u64,
+        target: [u8; 32],
+        vm: monario_randomx::Verifier,
+    ) -> Result<Self, Error> {
+        if vm.seed() != work.seed().as_slice() {
+            return Err(Error::Hash(monario_randomx::Error::InvalidSeed));
+        }
         let rules = Rules::new(work, prefix, start, end, target)?;
-        let vm = monario_randomx::Verifier::with_mode(&work.seed(), mode).map_err(Error::Hash)?;
         Ok(Self { rules, vm })
     }
+
     pub fn verify(&mut self, node: &Node, solution: &Solution) -> Result<Share, Error> {
         self.rules.check(node, solution, |input| {
             self.vm.hash(input).map_err(Error::Hash)

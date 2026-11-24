@@ -2,13 +2,17 @@
 //! Construction starts no thread, search or transport. The caller drives `tick`
 //! (from the existing node loop) or `run` (local-only loop).
 use super::{
-    Clock, Error as MiningError, Node, Submitted, Work, cpu, pool::session::Event as SessionEvent,
-    pool::session::Limits as SessionLimits, pool::tcp::ClientConfig, pool::tcp::TcpClient, refresh,
+    Clock, Error as MiningError, Node, Submitted, Work, cpu,
+    pool::link::Error as LinkError, pool::session::Error as SessionError,
+    pool::session::Event as SessionEvent, pool::session::Limits as SessionLimits,
+    pool::tcp::ClientConfig, pool::tcp::Error as PoolTransportError, pool::tcp::Phase,
+    pool::tcp::TcpClient, pool::wire::Error as WireError, refresh,
 };
 use crate::transport::Identity;
 use monario_address::{Address, Network, Receiver};
 use monario_chain::Hash;
 use std::{
+    collections::VecDeque,
     net::SocketAddr,
     sync::{
         Arc, Mutex,
@@ -20,23 +24,23 @@ use std::{
 };
 use zeroize::Zeroizing;
 
-/// Process-wide worker bound. Workers share a single 256 MiB RandomX cache.
 pub use monario_randomx::MAX_WORKERS;
-/// Published default for the official pool. Provisional: it is a name default,
-/// authenticated by the configured pool key. It is not an implicit trust anchor
-/// and this constant asserts no live service.
-pub const OFFICIAL_POOL_ADDRESS: &str = "pool.monario.org:19444";
 const MIN_POLL_MS: u64 = 10;
 const MAX_POLL_MS: u64 = 60_000;
 const MAX_TIMESTAMP_SECONDS: u32 = 3_600;
 const MAX_ADDRESS_BYTES: usize = 128;
 /// Coinbase extra data is public; the consensus encoder accepts at most 98 bytes.
 const MAX_EXTRA_DATA: usize = 98;
+/// One bounded slot per assignment-specific worker channel. A full slot applies
+/// backpressure to that worker only; it never blocks or stops its peers.
+const POOL_EVENT_CAPACITY: usize = 1;
+/// Bound the retry cadence after quota or link-buffer pressure.
+const POOL_RETRY_MS: u64 = 250;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     pub network: Network,
-    /// Inclusive 1..=MAX_WORKERS. Workers share one RandomX cache.
+    /// Local CPU worker count. Workers share the light cache for the active seed.
     pub workers: u8,
     /// Minimum monotonic interval between validated job refreshes.
     pub poll_ms: u64,
@@ -55,6 +59,10 @@ pub enum Error {
     Node(crate::Error),
     Spawn,
     Pool(super::pool::tcp::Error),
+    /// The pool server explicitly rejected the configured client credential.
+    PoolAuth,
+    /// A worker stopped without reporting exhaustion or a fatal error.
+    WorkerExit,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -92,19 +100,18 @@ impl CpuSearch {
     }
 
     fn verifier(&self, work: &Work) -> Result<monario_randomx::Verifier, cpu::Error> {
-        let seed = work.seed();
         let cache = {
-            let mut slot = self.cache.lock().map_err(|_| cpu::Error::CacheUnavailable)?;
-            let current = slot
-                .as_ref()
-                .map(|cache| cache.seed() == seed)
-                .unwrap_or(false);
-            if !current {
+            let mut slot = self
+                .cache
+                .lock()
+                .map_err(|_| cpu::Error::CacheUnavailable)?;
+            let seed = work.seed();
+            if slot.as_ref().is_none_or(|cache| cache.seed() != seed) {
+                // The operator joins the previous workers before changing jobs.
                 *slot = None;
-                *slot =
-                    Some(monario_randomx::SharedCache::new(&seed).map_err(cpu::Error::Hash)?);
+                *slot = Some(monario_randomx::SharedCache::new(&seed).map_err(cpu::Error::Hash)?);
             }
-            slot.clone().ok_or(cpu::Error::CacheUnavailable)?
+            slot.as_ref().expect("cache initialized").clone()
         };
         cache.verifier(self.mode).map_err(cpu::Error::Hash)
     }
@@ -151,6 +158,22 @@ pub struct Operator {
     backend: Arc<dyn Search>,
 }
 
+/// Validate a solo payout destination before a node is spawned or activated:
+/// real `monario-address` decoding against the intended network, with a
+/// transparent receiver only. No prefix or shape heuristics.
+pub fn validate_solo_address(address: &str, network: Network) -> Result<(), Error> {
+    if address.is_empty() || address.len() > MAX_ADDRESS_BYTES {
+        return Err(Error::Configuration);
+    }
+    match Address::decode(address, network)
+        .map_err(|_| Error::Configuration)?
+        .receiver()
+    {
+        Receiver::Transparent(_) => Ok(()),
+        Receiver::Private(_) => Err(Error::Configuration),
+    }
+}
+
 impl Operator {
     /// Validates configuration and payout destination; opens no thread or network.
     pub fn new(config: Config, address: String, extra_data: Vec<u8>) -> Result<Self, Error> {
@@ -159,19 +182,11 @@ impl Operator {
             || !(MIN_POLL_MS..=MAX_POLL_MS).contains(&config.poll_ms)
             || config.timestamp_seconds == 0
             || config.timestamp_seconds > MAX_TIMESTAMP_SECONDS
-            || address.is_empty()
-            || address.len() > MAX_ADDRESS_BYTES
             || extra_data.len() > MAX_EXTRA_DATA
         {
             return Err(Error::Configuration);
         }
-        match Address::decode(&address, config.network)
-            .map_err(|_| Error::Configuration)?
-            .receiver()
-        {
-            Receiver::Transparent(_) => {}
-            Receiver::Private(_) => return Err(Error::Configuration),
-        }
+        validate_solo_address(&address, config.network)?;
         Ok(Self::with_backend(
             config,
             refresh::Manager::new(address, config.network, extra_data),
@@ -294,7 +309,7 @@ impl Operator {
     fn collect(&mut self, node: &mut Node, clock: Clock) -> Result<Option<Hash>, Error> {
         let mut events = Vec::new();
         if let Some(receiver) = &self.events {
-            for _ in 0..=usize::from(MAX_WORKERS) {
+            for _ in 0..self.config.workers {
                 match receiver.try_recv() {
                     Ok(event) => events.push(event),
                     Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
@@ -416,8 +431,14 @@ impl Drop for Operator {
 // ---------------------------------------------------------------------------
 
 /// Blocking search primitive for pool-assigned work, executed in a worker thread.
-/// Implementations must return `Ok(None)` when cancelled and must never submit.
+/// Implementations must keep one cursor for the whole assigned partition, report
+/// every candidate through `share` (returning `false` stops the search), and must
+/// never submit. `Ok(())` means the assigned range is exhausted or cancelled.
 trait PoolSearch: Send + Sync {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Explicit job, partition, target, cancellation and share boundaries"
+    )]
     fn search(
         &self,
         work: &Work,
@@ -426,10 +447,15 @@ trait PoolSearch: Send + Sync {
         end: u64,
         target: [u8; 32],
         cancel: &AtomicBool,
-    ) -> Result<Option<[u8; 32]>, cpu::Error>;
+        share: &mut dyn FnMut([u8; 32]) -> bool,
+    ) -> Result<(), cpu::Error>;
 }
 
 impl PoolSearch for CpuSearch {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Explicit job, partition, target, cancellation and share boundaries"
+    )]
     fn search(
         &self,
         work: &Work,
@@ -438,25 +464,24 @@ impl PoolSearch for CpuSearch {
         end: u64,
         target: [u8; 32],
         cancel: &AtomicBool,
-    ) -> Result<Option<[u8; 32]>, cpu::Error> {
+        share: &mut dyn FnMut([u8; 32]) -> bool,
+    ) -> Result<(), cpu::Error> {
         if cancel.load(Ordering::Acquire) {
-            return Ok(None);
+            return Ok(());
         }
-        let mut miner = cpu::Miner::with_pool_verifier(
-            work,
-            start,
-            end,
-            prefix,
-            target,
-            self.verifier(work)?,
-        )?;
+        // Build one miner for the assignment so every reported share continues
+        // from the existing cursor instead of restarting the partition.
+        let mut miner =
+            cpu::Miner::with_pool_verifier(work, start, end, prefix, target, self.verifier(work)?)?;
         loop {
             match miner.search_batch(cpu::MAX_BATCH, cancel)? {
-                cpu::Batch::Found(solution) => return Ok(Some(solution.nonce)),
+                cpu::Batch::Found(solution) => {
+                    if !share(solution.nonce) {
+                        return Ok(());
+                    }
+                }
                 cpu::Batch::Pending => {}
-                cpu::Batch::Cancelled => return Ok(None),
-                // An exhausted assigned partition is not an error; wait for a new job.
-                cpu::Batch::Exhausted => return Ok(None),
+                cpu::Batch::Cancelled | cpu::Batch::Exhausted => return Ok(()),
             }
         }
     }
@@ -471,7 +496,7 @@ pub struct PoolOperatorConfig {
     pub profile: [u8; 32],
     pub client: [u8; 16],
     pub token: Zeroizing<[u8; 32]>,
-    /// Inclusive 1..=MAX_WORKERS. Workers share one 256 MiB RandomX cache.
+    /// Local CPU worker count. Workers share the light cache for the active seed.
     pub workers: u8,
     /// Minimum monotonic interval between pool polls.
     pub poll_ms: u64,
@@ -483,11 +508,49 @@ pub struct PoolOperatorConfig {
 /// the pool; they are not block receipts, durable credits or payouts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PoolStatus {
+    /// True only for an authenticated session, never for a bare transport
+    /// connection or a rejected credential.
     pub connected: bool,
+    pub phase: Phase,
     pub assigned: bool,
     pub workers: usize,
     pub submitted: u64,
     pub block_candidates: u64,
+}
+
+/// One candidate produced by a worker, bound to the exact assignment and job
+/// that produced it so a replaced assignment can never submit stale work.
+struct PoolShare {
+    assignment: [u8; 32],
+    job: [u8; 32],
+    nonce: [u8; 32],
+}
+
+enum PoolEvent {
+    /// The worker searched its whole partition and is stopping normally.
+    Exhausted,
+    /// The worker stopped because hashing/cache setup failed.
+    Fatal(cpu::Error),
+}
+
+struct PoolWorker {
+    cancel: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+    /// Bounded, assignment-specific share queue. Dropping it unblocks a worker
+    /// that is waiting on a full queue during shutdown.
+    shares: WorkReceiver<PoolShare>,
+    /// Bounded terminal report, separate from shares so fatal errors surface
+    /// even while share backpressure is pausing the worker.
+    outcome: WorkReceiver<PoolEvent>,
+    /// A terminal event was observed for this worker.
+    terminated: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubmitDisposition {
+    Submitted,
+    Retry,
+    Stale,
 }
 
 /// Pool-mode operator. Construction opens no socket; `run`/`run_with` is the
@@ -500,12 +563,97 @@ pub struct PoolOperator {
     poll_ms: u64,
     assignment: Option<[u8; 32]>,
     job: Option<Arc<Work>>,
-    workers: Vec<Worker>,
-    events: Option<WorkReceiver<Result<Option<[u8; 32]>, cpu::Error>>>,
+    workers: Vec<PoolWorker>,
+    /// Bounded retry queue for shares the client quota temporarily refused.
+    pending: VecDeque<PoolShare>,
+    /// Monotonic time before which quota/link pressure is not retried.
+    retry_at: Option<u64>,
     backend: Arc<dyn PoolSearch>,
     submitted: u64,
     block_candidates: u64,
     last_poll: Option<u64>,
+}
+
+/// Quota and a full link writer buffer are retryable backpressure; a replaced
+/// assignment is stale, not fatal. Closed/IO/wire-format failures stay fatal.
+fn classify_submit(
+    result: Result<(), PoolTransportError>,
+) -> Result<SubmitDisposition, PoolTransportError> {
+    match result {
+        Ok(()) => Ok(SubmitDisposition::Submitted),
+        Err(PoolTransportError::Session(SessionError::Quota)) => Ok(SubmitDisposition::Retry),
+        Err(PoolTransportError::Link(LinkError::Wire(WireError::Oversized))) => {
+            Ok(SubmitDisposition::Retry)
+        }
+        Err(PoolTransportError::Session(SessionError::Assignment)) => Ok(SubmitDisposition::Stale),
+        Err(error) => Err(error),
+    }
+}
+
+/// Spawn one worker for one assignment-specific, bounded event queue. The worker
+/// keeps its cursor across every reported share and only exits on exhaustion,
+/// cancellation, channel closure or a fatal hashing error.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Explicit job, partition, target, assignment and backend boundaries"
+)]
+fn spawn_pool_worker(
+    index: u8,
+    work: Arc<Work>,
+    assignment: [u8; 32],
+    prefix: [u8; 24],
+    start: u64,
+    end: u64,
+    target: [u8; 32],
+    backend: Arc<dyn PoolSearch>,
+) -> std::io::Result<PoolWorker> {
+    let (share_sender, shares) = mpsc::sync_channel(POOL_EVENT_CAPACITY);
+    let (outcome_sender, outcome) = mpsc::sync_channel(POOL_EVENT_CAPACITY);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let signal = cancel.clone();
+    let job = work.id();
+    let handle = thread::Builder::new()
+        .name(format!("monar-pool-miner-{index}"))
+        .spawn(move || {
+            let query = backend.search(
+                &work,
+                prefix,
+                start,
+                end,
+                target,
+                &signal,
+                &mut |nonce| {
+                    share_sender
+                        .send(PoolShare {
+                            assignment,
+                            job,
+                            nonce,
+                        })
+                        .is_ok()
+                },
+            );
+            let terminal = match query {
+                Ok(()) => PoolEvent::Exhausted,
+                Err(error) => PoolEvent::Fatal(error),
+            };
+            let _ = outcome_sender.send(terminal);
+        })?;
+    Ok(PoolWorker {
+        cancel,
+        handle,
+        shares,
+        outcome,
+        terminated: false,
+    })
+}
+
+/// Set cancellation, unblock a possible full-queue send by dropping both
+/// receivers, then join. This keeps shutdown bounded even under backpressure.
+fn stop_pool_worker(worker: PoolWorker) {
+    worker.cancel.store(true, Ordering::Release);
+    drop(worker.shares);
+    drop(worker.outcome);
+    let _ = worker.handle.join();
 }
 
 impl PoolOperator {
@@ -541,7 +689,8 @@ impl PoolOperator {
             assignment: None,
             job: None,
             workers: Vec::new(),
-            events: None,
+            pending: VecDeque::new(),
+            retry_at: None,
             backend: Arc::new(CpuSearch::new(config.mode)),
             submitted: 0,
             block_candidates: 0,
@@ -562,7 +711,17 @@ impl PoolOperator {
             .is_none_or(|at| clock.monotonic_ms.saturating_sub(at) >= self.poll_ms)
         {
             self.last_poll = Some(clock.monotonic_ms);
-            let events = self.client.tick(node, clock).map_err(Error::Pool)?;
+            let events = match self.client.tick(node, clock) {
+                Ok(events) => events,
+                Err(error) => {
+                    // A transport/session failure makes the assignment unusable;
+                    // never keep hashing or submitting against it.
+                    self.stop_workers();
+                    self.assignment = None;
+                    self.job = None;
+                    return Err(Error::Pool(error));
+                }
+            };
             for event in events {
                 if let SessionEvent::Accepted {
                     block_candidate: true,
@@ -572,16 +731,32 @@ impl PoolOperator {
                     self.block_candidates = self.block_candidates.saturating_add(1);
                 }
             }
+            // A server credential rejection is terminal for this connection: do
+            // not retry the secret and do not keep reporting "connected".
+            if self.client.phase() == Phase::Rejected {
+                self.stop_workers();
+                self.assignment = None;
+                self.job = None;
+                return Err(Error::PoolAuth);
+            }
             self.refresh_assignment()?;
         }
         self.collect(clock)?;
-        Ok(PoolStatus {
-            connected: self.client.is_connected(),
+        Ok(self.status())
+    }
+
+    /// Current public snapshot, available after a failed tick for a terminal
+    /// status write. Shares are observations, not payouts.
+    pub fn status(&self) -> PoolStatus {
+        let phase = self.client.phase();
+        PoolStatus {
+            connected: phase == Phase::Authenticated,
+            phase,
             assigned: self.assignment.is_some(),
-            workers: self.workers.len(),
+            workers: self.active_workers(),
             submitted: self.submitted,
             block_candidates: self.block_candidates,
-        })
+        }
     }
 
     fn refresh_assignment(&mut self) -> Result<(), Error> {
@@ -600,7 +775,10 @@ impl PoolOperator {
                 }
             }
             None => {
-                if self.assignment.is_some() || !self.workers.is_empty() {
+                if self.assignment.is_some()
+                    || !self.workers.is_empty()
+                    || !self.pending.is_empty()
+                {
                     self.stop_workers();
                     self.assignment = None;
                     self.job = None;
@@ -618,72 +796,213 @@ impl PoolOperator {
         target: [u8; 32],
     ) -> Result<(), Error> {
         let work = self.job.clone().ok_or(Error::Configuration)?;
+        let assignment = self.assignment.ok_or(Error::Configuration)?;
         if !self.workers.is_empty() {
             return Err(Error::Configuration);
         }
-        let (sender, receiver) = mpsc::channel();
-        let mut workers: Vec<Worker> = Vec::new();
+        let mut workers: Vec<PoolWorker> = Vec::new();
         for index in 0..self.workers_limit {
             let (lo, hi) = partition_range(start, end, index, self.workers_limit);
             if lo > hi {
                 continue;
             }
-            let cancel = Arc::new(AtomicBool::new(false));
-            let signal = cancel.clone();
-            let job = work.clone();
-            let events = sender.clone();
-            let backend = self.backend.clone();
-            let handle = match thread::Builder::new()
-                .name(format!("monar-pool-miner-{index}"))
-                .spawn(move || {
-                    let event = backend.search(&job, prefix, lo, hi, target, &signal);
-                    let _ = events.send(event);
-                }) {
-                Ok(handle) => handle,
+            match spawn_pool_worker(
+                index,
+                work.clone(),
+                assignment,
+                prefix,
+                lo,
+                hi,
+                target,
+                self.backend.clone(),
+            ) {
+                Ok(worker) => workers.push(worker),
                 Err(_) => {
                     for worker in workers {
-                        worker.cancel.store(true, Ordering::Release);
-                        let _ = worker.handle.join();
+                        stop_pool_worker(worker);
                     }
                     return Err(Error::Spawn);
                 }
-            };
-            workers.push(Worker { cancel, handle });
+            }
         }
-        drop(sender);
         self.workers = workers;
-        self.events = Some(receiver);
         Ok(())
     }
 
+    fn pending_capacity(&self) -> usize {
+        usize::from(self.workers_limit).max(1)
+    }
+
     fn collect(&mut self, clock: Clock) -> Result<(), Error> {
-        let mut events = Vec::new();
-        if let Some(receiver) = &self.events {
-            for _ in 0..=usize::from(MAX_WORKERS) {
-                match receiver.try_recv() {
-                    Ok(event) => events.push(event),
-                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+        // Terminal reports get at most one bounded check per worker each tick,
+        // independent of share backpressure, so fatal errors are never hidden.
+        let mut outcomes = Vec::new();
+        for worker in &mut self.workers {
+            if let Ok(event) = worker.outcome.try_recv() {
+                worker.terminated = true;
+                outcomes.push(event);
+            }
+        }
+
+        let blocked = self.retry_pending(clock)?;
+        let capacity = self.pending_capacity();
+        let mut shares = Vec::new();
+        // At most one share per worker per tick. Stop pulling as soon as the
+        // bounded retry queue is full; full channels then pause producers.
+        let mut pulled_all = !blocked && self.pending.len() < capacity;
+        if pulled_all {
+            for worker in &mut self.workers {
+                if self.pending.len() + shares.len() >= capacity {
+                    pulled_all = false;
+                    break;
+                }
+                if let Ok(share) = worker.shares.try_recv() {
+                    shares.push(share);
                 }
             }
         }
-        for event in events {
-            match event {
-                Ok(Some(nonce)) => {
-                    if self.client.submit(nonce, clock).is_ok() {
-                        self.submitted = self.submitted.saturating_add(1);
-                    } else {
-                        // A rejected assignment (stale or replaced) cancels search.
-                        self.stop_workers();
-                    }
+
+        // Reap only when the bounded budget has room for a possible final
+        // share, then remove and join. After the join, the receiver is
+        // definitive: either one buffered share or `Disconnected`.
+        if pulled_all {
+            let mut index = 0;
+            while index < self.workers.len() {
+                if !self.workers[index].handle.is_finished() {
+                    index += 1;
+                    continue;
                 }
-                Ok(None) => {}
-                Err(error) => {
+                if self.pending.len() + shares.len() >= capacity {
+                    index += 1;
+                    continue;
+                }
+                let worker = self.workers.remove(index);
+                let cancelled = worker.cancel.load(Ordering::Acquire);
+                let _ = worker.handle.join();
+                let mut terminated = worker.terminated;
+                if let Ok(event) = worker.outcome.try_recv() {
+                    terminated = true;
+                    outcomes.push(event);
+                }
+                if !cancelled && !terminated {
                     self.stop_workers();
-                    return Err(Error::Worker(error));
+                    return Err(Error::WorkerExit);
+                }
+                match worker.shares.try_recv() {
+                    Ok(share) => {
+                        shares.push(share);
+                        // Capacity is one and no sender remains after join.
+                        debug_assert!(matches!(
+                            worker.shares.try_recv(),
+                            Err(TryRecvError::Disconnected)
+                        ));
+                    }
+                    Err(TryRecvError::Disconnected) => {}
+                    // Unreachable after join, but keep the candidate safe by
+                    // leaving the worker's receiver dropped only once budgeted.
+                    Err(TryRecvError::Empty) => {}
                 }
             }
+        }
+
+        for event in outcomes {
+            if let PoolEvent::Fatal(error) = event {
+                self.stop_workers();
+                return Err(Error::Worker(error));
+            }
+        }
+        for share in shares {
+            // A candidate from a replaced assignment or job is stale.
+            if self.assignment != Some(share.assignment) {
+                continue;
+            }
+            let Some(work) = &self.job else {
+                continue;
+            };
+            if work.id() != share.job {
+                continue;
+            }
+            self.submit_share(share, clock)?;
         }
         Ok(())
+    }
+
+    /// Retry quota/link-delayed shares on a bounded cadence. Returns true while
+    /// pressure persists, which pauses new pulls and lets channels backpressure
+    /// workers without evicting valid candidates.
+    fn retry_pending(&mut self, clock: Clock) -> Result<bool, Error> {
+        if self.pending.is_empty() {
+            self.retry_at = None;
+            return Ok(false);
+        }
+        if self
+            .retry_at
+            .is_some_and(|at| clock.monotonic_ms < at)
+        {
+            return Ok(true);
+        }
+        let capacity = self.pending_capacity();
+        for _ in 0..capacity {
+            let Some(share) = self.pending.pop_front() else {
+                self.retry_at = None;
+                return Ok(false);
+            };
+            if self.assignment != Some(share.assignment) {
+                continue;
+            }
+            if self.job.as_ref().is_none_or(|work| work.id() != share.job) {
+                continue;
+            }
+            match classify_submit(self.client.submit(share.nonce, clock)) {
+                Ok(SubmitDisposition::Submitted) => {
+                    self.submitted = self.submitted.saturating_add(1);
+                }
+                Ok(SubmitDisposition::Retry) => {
+                    self.pending.push_front(share);
+                    self.retry_at =
+                        Some(clock.monotonic_ms.saturating_add(POOL_RETRY_MS));
+                    return Ok(true);
+                }
+                Ok(SubmitDisposition::Stale) => {}
+                Err(error) => {
+                    self.stop_workers();
+                    return Err(Error::Pool(error));
+                }
+            }
+        }
+        if self.pending.is_empty() {
+            self.retry_at = None;
+            Ok(false)
+        } else {
+            self.retry_at = Some(clock.monotonic_ms.saturating_add(POOL_RETRY_MS));
+            Ok(true)
+        }
+    }
+
+    fn submit_share(&mut self, share: PoolShare, clock: Clock) -> Result<(), Error> {
+        match classify_submit(self.client.submit(share.nonce, clock)) {
+            Ok(SubmitDisposition::Submitted) => {
+                self.submitted = self.submitted.saturating_add(1);
+                Ok(())
+            }
+            Ok(SubmitDisposition::Retry) => {
+                // The pull budget above guarantees room for every accepted
+                // candidate; valid shares are queued, never evicted.
+                debug_assert!(self.pending.len() < self.pending_capacity());
+                self.pending.push_back(share);
+                if self.retry_at.is_none() {
+                    self.retry_at =
+                        Some(clock.monotonic_ms.saturating_add(POOL_RETRY_MS));
+                }
+                Ok(())
+            }
+            // The assignment/job was replaced between hashing and submission.
+            Ok(SubmitDisposition::Stale) => Ok(()),
+            Err(error) => {
+                self.stop_workers();
+                Err(Error::Pool(error))
+            }
+        }
     }
 
     fn stop_workers(&mut self) {
@@ -691,9 +1010,10 @@ impl PoolOperator {
             worker.cancel.store(true, Ordering::Release);
         }
         for worker in self.workers.drain(..) {
-            let _ = worker.handle.join();
+            stop_pool_worker(worker);
         }
-        self.events = None;
+        self.pending.clear();
+        self.retry_at = None;
     }
 
     /// Cancel and join every worker, close the session; safe to call repeatedly.
@@ -706,7 +1026,10 @@ impl PoolOperator {
     }
 
     pub fn active_workers(&self) -> usize {
-        self.workers.len()
+        self.workers
+            .iter()
+            .filter(|worker| !worker.handle.is_finished())
+            .count()
     }
 
     /// Explicit network activation. Opens one authenticated, encrypted pool
@@ -914,6 +1237,7 @@ mod tests {
 
     #[test]
     fn changed_tip_cancels_and_joins_every_old_worker_before_replacement() {
+        let count = 6;
         let _serial = crate::tests::REAL.lock().unwrap();
         let (_dir, mut node) = crate::tests::node();
         let parents = Arc::new(Mutex::new(Vec::new()));
@@ -923,26 +1247,27 @@ mod tests {
             cancelled: cancelled.clone(),
         });
         let mut operator = Operator::with_backend(
-            config(2),
+            config(count),
             refresh::Manager::new(address(), Network::Regtest, vec![]),
             backend,
         );
+        let count = usize::from(count);
         let first = operator.tick(&mut node, at(10)).unwrap();
         assert!(first.refreshed);
-        wait_for(|| parents.lock().unwrap().len() >= 2);
+        wait_for(|| parents.lock().unwrap().len() >= count);
         let old_tip = node.source().chain().unwrap().tip();
         let new_tip = crate::tests::append(&mut node, old_tip, vec![], 10);
         assert_ne!(old_tip, new_tip);
         let second = operator.tick(&mut node, at(20)).unwrap();
         assert!(second.refreshed);
-        assert_eq!(cancelled.load(Ordering::Acquire), 2);
-        wait_for(|| parents.lock().unwrap().len() >= 4);
+        assert_eq!(cancelled.load(Ordering::Acquire), count);
+        wait_for(|| parents.lock().unwrap().len() >= count * 2);
         let seen = parents.lock().unwrap().clone();
-        assert_eq!(&seen[..2], &[old_tip, old_tip]);
-        assert_eq!(&seen[2..], &[new_tip, new_tip]);
-        assert_eq!(operator.active_workers(), 2);
+        assert_eq!(&seen[..count], &[old_tip; 6]);
+        assert_eq!(&seen[count..], &[new_tip; 6]);
+        assert_eq!(operator.active_workers(), count);
         operator.shutdown();
-        assert_eq!(cancelled.load(Ordering::Acquire), 4);
+        assert_eq!(cancelled.load(Ordering::Acquire), count * 2);
         assert_eq!(operator.active_workers(), 0);
     }
 
@@ -961,6 +1286,29 @@ mod tests {
         let stop = AtomicBool::new(true);
         operator.run(&mut node, &stop).unwrap();
         assert_eq!(operator.active_workers(), 0);
+    }
+
+    #[test]
+    fn solo_payout_address_requires_matching_network_and_transparent_receiver() {
+        const REGTEST: &str = "rmont1qyqqqqgzqvzq2ps8pqys5zcvp58q7yq3zgfs7grwe7";
+        const TEST: &str = "testmont1qyqqqqgzqvzq2ps8pqys5zcvp58q7yq3zgfsxp6xum";
+        const REGTEST_PRIVATE: &str =
+            "rmonz1qypgluecd9cuke9cuaufjzxa367hm6f2drjcdg6dhrl2nx006gqkltnkw5904elwjstyd09ey8n3q4";
+        assert!(validate_solo_address(REGTEST, Network::Regtest).is_ok());
+        assert!(validate_solo_address(REGTEST, Network::Test).is_err());
+        assert!(validate_solo_address(REGTEST, Network::Main).is_err());
+        assert!(validate_solo_address(TEST, Network::Regtest).is_err());
+        assert!(validate_solo_address(REGTEST_PRIVATE, Network::Regtest).is_err());
+        assert!(validate_solo_address("rmont1fixture", Network::Regtest).is_err());
+        assert!(validate_solo_address("", Network::Regtest).is_err());
+        assert!(matches!(
+            Operator::new(config(1), REGTEST_PRIVATE.into(), vec![]),
+            Err(Error::Configuration)
+        ));
+        assert!(matches!(
+            Operator::new(config(1), TEST.into(), vec![]),
+            Err(Error::Configuration)
+        ));
     }
 
     #[test]
@@ -1082,5 +1430,239 @@ mod tests {
         let mut bad = pool_config(1);
         bad.pool_key = [0; 32];
         assert!(matches!(PoolOperator::new(bad), Err(Error::Configuration)));
+    }
+
+    fn prepared_work(node: &mut Node) -> Work {
+        let address = address();
+        node.prepare_work(
+            super::super::Request {
+                address: &address,
+                network: Network::Regtest,
+                timestamp: 1_105,
+                extra_data: b"",
+            },
+            clock(0),
+        )
+        .unwrap()
+        .work
+    }
+
+    /// Offline fake: reports `shares` candidates, then stays live until cancelled.
+    struct RepeatingPoolSearch {
+        shares: usize,
+        starts: Arc<Mutex<Vec<(u64, u64)>>>,
+        reported: Arc<AtomicUsize>,
+    }
+
+    impl PoolSearch for RepeatingPoolSearch {
+        #[expect(
+            clippy::too_many_arguments,
+            reason = "Matches the explicit worker search boundary"
+        )]
+        fn search(
+            &self,
+            _work: &Work,
+            prefix: [u8; 24],
+            start: u64,
+            end: u64,
+            _target: [u8; 32],
+            cancel: &AtomicBool,
+            share: &mut dyn FnMut([u8; 32]) -> bool,
+        ) -> Result<(), cpu::Error> {
+            self.starts.lock().unwrap().push((start, end));
+            for offset in 0..self.shares {
+                if cancel.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                let mut nonce = [0u8; 32];
+                nonce[..8].copy_from_slice(&start.saturating_add(offset as u64).to_le_bytes());
+                nonce[8..].copy_from_slice(&prefix);
+                if !share(nonce) {
+                    return Ok(());
+                }
+                self.reported.fetch_add(1, Ordering::Release);
+            }
+            while !cancel.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pool_workers_keep_searching_after_candidates_and_report_live_count() {
+        let (_dir, mut node) = crate::tests::node();
+        let work = Arc::new(prepared_work(&mut node));
+        let starts = Arc::new(Mutex::new(Vec::new()));
+        let mut operator = PoolOperator::new(pool_config(2)).unwrap();
+        operator.backend = Arc::new(RepeatingPoolSearch {
+            shares: 2,
+            starts: starts.clone(),
+            reported: Arc::new(AtomicUsize::new(0)),
+        });
+        operator.assignment = Some([4; 32]);
+        operator.job = Some(work.clone());
+        operator
+            .start_workers(100, 199, [7; 24], [255; 32])
+            .unwrap();
+
+        let mut received = Vec::new();
+        for _ in 0..2_000 {
+            for worker in &mut operator.workers {
+                if let Ok(share) = worker.shares.try_recv() {
+                    received.push(share);
+                }
+            }
+            if received.len() >= 4 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(received.len(), 4);
+        assert!(
+            received
+                .iter()
+                .all(|share| share.assignment == [4; 32] && share.job == work.id())
+        );
+        assert_eq!(operator.active_workers(), 2);
+        assert!(
+            operator
+                .workers
+                .iter()
+                .all(|worker| !worker.handle.is_finished()),
+            "a share candidate must not retire its worker"
+        );
+        let mut starts = starts.lock().unwrap().clone();
+        starts.sort_unstable();
+        assert_eq!(starts, vec![(100, 149), (150, 199)]);
+        operator.shutdown();
+        assert_eq!(operator.active_workers(), 0);
+    }
+
+    #[test]
+    fn full_pool_queue_is_bounded_and_shutdown_still_joins() {
+        let (_dir, mut node) = crate::tests::node();
+        let work = Arc::new(prepared_work(&mut node));
+        let starts = Arc::new(Mutex::new(Vec::new()));
+        let reported = Arc::new(AtomicUsize::new(0));
+        let mut operator = PoolOperator::new(pool_config(1)).unwrap();
+        operator.backend = Arc::new(RepeatingPoolSearch {
+            shares: 2,
+            starts: starts.clone(),
+            reported: reported.clone(),
+        });
+        operator.assignment = Some([5; 32]);
+        operator.job = Some(work);
+        operator
+            .start_workers(0, 999, [8; 24], [255; 32])
+            .unwrap();
+
+        // Consume the first candidate so the second fills the only queue slot.
+        wait_for(|| operator.workers[0].shares.try_recv().is_ok());
+        wait_for(|| reported.load(Ordering::Acquire) >= 2);
+        assert_eq!(operator.workers.len(), 1);
+        // The queue is full; cancellation must drop the receiver to unblock and
+        // join the worker instead of hanging forever.
+        operator.shutdown();
+        assert_eq!(operator.active_workers(), 0);
+    }
+
+    /// Offline fake: reports exactly one candidate and exits normally.
+    struct ExitingPoolSearch;
+
+    impl PoolSearch for ExitingPoolSearch {
+        #[expect(
+            clippy::too_many_arguments,
+            reason = "Matches the explicit worker search boundary"
+        )]
+        fn search(
+            &self,
+            _work: &Work,
+            prefix: [u8; 24],
+            start: u64,
+            _end: u64,
+            _target: [u8; 32],
+            _cancel: &AtomicBool,
+            share: &mut dyn FnMut([u8; 32]) -> bool,
+        ) -> Result<(), cpu::Error> {
+            let mut nonce = [0u8; 32];
+            nonce[..8].copy_from_slice(&start.to_le_bytes());
+            nonce[8..].copy_from_slice(&prefix);
+            let _ = share(nonce);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn final_share_is_not_lost_when_a_worker_exits() {
+        let (_dir, mut node) = crate::tests::node();
+        let work = Arc::new(prepared_work(&mut node));
+        let worker = spawn_pool_worker(
+            0,
+            work,
+            [9; 32],
+            [3; 24],
+            42,
+            42,
+            [255; 32],
+            Arc::new(ExitingPoolSearch),
+        )
+        .unwrap();
+        wait_for(|| worker.handle.is_finished());
+        let share = worker.shares.try_recv().unwrap();
+        assert_eq!(
+            u64::from_le_bytes(share.nonce[..8].try_into().unwrap()),
+            42
+        );
+        assert_eq!(&share.nonce[8..], &[3; 24]);
+        assert_eq!(share.assignment, [9; 32]);
+        assert!(matches!(
+            worker.shares.try_recv(),
+            Err(TryRecvError::Disconnected)
+        ));
+        assert!(matches!(worker.outcome.try_recv(), Ok(PoolEvent::Exhausted)));
+
+        let mut operator = PoolOperator::new(pool_config(1)).unwrap();
+        operator.workers.push(worker);
+        operator.stop_workers();
+        assert_eq!(operator.active_workers(), 0);
+    }
+
+    #[test]
+    fn pool_submit_dispositions_separate_retry_stale_and_fatal() {
+        assert_eq!(
+            classify_submit(Ok(())).unwrap(),
+            SubmitDisposition::Submitted
+        );
+        assert_eq!(
+            classify_submit(Err(PoolTransportError::Session(SessionError::Quota))).unwrap(),
+            SubmitDisposition::Retry
+        );
+        assert_eq!(
+            classify_submit(Err(PoolTransportError::Link(LinkError::Wire(
+                WireError::Oversized
+            ))))
+            .unwrap(),
+            SubmitDisposition::Retry
+        );
+        assert_eq!(
+            classify_submit(Err(PoolTransportError::Session(
+                SessionError::Assignment
+            )))
+            .unwrap(),
+            SubmitDisposition::Stale
+        );
+        assert!(matches!(
+            classify_submit(Err(PoolTransportError::Io)),
+            Err(PoolTransportError::Io)
+        ));
+        assert!(matches!(
+            classify_submit(Err(PoolTransportError::Session(SessionError::Closed))),
+            Err(PoolTransportError::Session(SessionError::Closed))
+        ));
+        assert!(matches!(
+            classify_submit(Err(PoolTransportError::Link(LinkError::Closed))),
+            Err(PoolTransportError::Link(LinkError::Closed))
+        ));
     }
 }

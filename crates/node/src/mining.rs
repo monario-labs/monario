@@ -88,6 +88,21 @@ impl Work {
     pub fn parent(&self) -> Hash {
         self.header.parent
     }
+    /// Identifier of the exact block this work and nonce would produce. Used to
+    /// journal a block candidate before the node import call. Decoding reuses the
+    /// canonical codec and the current profile limits, so an invalid packet is
+    /// rejected before a pending credit record is written.
+    pub fn block_id(
+        &self,
+        source: &DurableChain<V6Verifier>,
+        nonce: [u8; 32],
+    ) -> Result<Hash, Error> {
+        let c = source.chain().map_err(|_| Error::Storage)?;
+        let mut block = wire::decode(&self.packet[PREFIX..], c.limits(), &V6Verifier)
+            .map_err(Error::Consensus)?;
+        block.header.nonce = nonce;
+        Ok(block.header.id(&c.chain_id()))
+    }
     /// Revalidate an untrusted packet against its retained parent without hashing PoW.
     /// The packet has no authority to select a profile, seed, difficulty or root.
     pub fn decode(source: &DurableChain<V6Verifier>, raw: &[u8], now: u64) -> Result<Self, Error> {

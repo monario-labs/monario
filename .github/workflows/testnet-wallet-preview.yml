@@ -1,0 +1,125 @@
+name: Testnet wallet preview
+
+on:
+  push:
+    branches:
+      - ci/testnet-wallet-preview
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUSTUP_TOOLCHAIN: "1.96.1"
+  CARGO_BUILD_JOBS: "2"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  preview:
+    name: ${{ matrix.slug }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            slug: windows-x86_64
+            host: x86_64-pc-windows-msvc
+            arch: X64
+          - runner: ubuntu-24.04
+            slug: linux-x86_64
+            host: x86_64-unknown-linux-gnu
+            arch: X64
+          - runner: macos-15-intel
+            slug: macos-x86_64
+            host: x86_64-apple-darwin
+            arch: X64
+          - runner: xcode-27
+            slug: macos-arm64
+            host: aarch64-apple-darwin
+            arch: Arm64
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Build and test testnet wallet preview
+        shell: pwsh
+        env:
+          SLUG: ${{ matrix.slug }}
+          EXPECTED_HOST: ${{ matrix.host }}
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+
+          function Invoke-Native {
+            param([string[]]$Command)
+            $exe = $Command[0]
+            $rest = @($Command | Select-Object -Skip 1)
+            & $exe @rest
+            if ($LASTEXITCODE -ne 0) { throw "Command failed with exit code ${LASTEXITCODE}: $exe" }
+          }
+
+          $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+          if ($arch -ne $env:EXPECTED_ARCH) { throw "Runner architecture $arch does not match expected $env:EXPECTED_ARCH" }
+
+          $parent = Join-Path $env:RUNNER_TEMP ('tnw-' + [System.IO.Path]::GetRandomFileName().Replace('.', ''))
+          $stage = $parent
+          $source = Join-Path $stage 'source'
+          $archive = Join-Path $stage 'archive.tar'
+          New-Item -ItemType Directory -Force -Path $source | Out-Null
+
+          $privateValues = @($env:GITHUB_WORKSPACE, $env:RUNNER_TEMP, $stage, (Resolve-Path -LiteralPath $source).ProviderPath) | Where-Object { $_ }
+          $privateTerms = Join-Path $stage 'private-terms'
+          [System.IO.File]::WriteAllLines($privateTerms, [string[]]$privateValues)
+
+          Invoke-Native @('git', '-C', $env:GITHUB_WORKSPACE, 'archive', '-o', $archive, 'HEAD', 'Cargo.toml', 'Cargo.lock', 'crates', 'src', 'tests', 'vendor', 'launch/testnet', 'launch/bootstrap', 'docs/desktop-release.md', 'website/assets/monario-mark.png', 'tools/build_private.py', 'tools/package_desktop.py', 'tools/verify_vendor.py')
+          Invoke-Native @('tar', '-xf', $archive, '-C', $source)
+
+          $py = if ($IsWindows) { 'python' } else { 'python3' }
+
+          Invoke-Native @('rustup', 'toolchain', 'install', $env:RUSTUP_TOOLCHAIN, '--profile', 'minimal', '--target', $env:EXPECTED_HOST)
+
+          Set-Location $source
+          if ($IsMacOS) {
+            $env:TMPDIR = (& /bin/sh -c 'cd "${TMPDIR:-/tmp}" && pwd -P').Trim()
+          }
+          $rustcVerbose = & rustc -vV
+          if ($LASTEXITCODE -ne 0) { throw 'rustc -vV failed' }
+          $hostLine = @($rustcVerbose | ForEach-Object { $_.Trim() } | Where-Object { $_ -like 'host: *' })
+          if ($hostLine.Count -ne 1 -or $hostLine[0] -ne "host: $env:EXPECTED_HOST") { throw "rustc host does not match expected $env:EXPECTED_HOST" }
+
+          $env:CARGO_TARGET_DIR = Join-Path $stage 'target'
+          Invoke-Native @('cargo', 'fetch', '--locked', '--target', $env:EXPECTED_HOST)
+          $env:CARGO_NET_OFFLINE = 'true'
+
+          Invoke-Native @('cargo', 'test', '--locked', '--offline', '-p', 'monario-wallet-gui', '--lib', '--', 'node_activation_is_always_explicit', 'solo_payout_address_needs_matching_network_and_transparent_receiver', 'custom_pool_passes_credentials_on_stdin_only', 'custom_mining_shows_pool_connection_fields_without_a_preset', 'pool_phase_status_is_optional_and_rejection_is_typed')
+
+          Invoke-Native @($py, 'tools/verify_vendor.py')
+          $env:MONARIO_PRIVATE_SCAN_FILE = $privateTerms
+          Invoke-Native @($py, 'tools/package_desktop.py')
+
+          $ext = if ($IsLinux) { '.tar.gz' } else { '.zip' }
+          $packageName = "monario-testnet-desktop-$env:SLUG$ext"
+          $packagePath = Join-Path $env:CARGO_TARGET_DIR $packageName
+          if (-not (Test-Path -LiteralPath $packagePath -PathType Leaf)) { throw "Expected package output at $packagePath for $env:SLUG" }
+
+          $artifactDir = Join-Path (Join-Path $env:RUNNER_TEMP 'artifacts') $env:SLUG
+          New-Item -ItemType Directory -Force -Path $artifactDir | Out-Null
+          Copy-Item -LiteralPath $packagePath -Destination (Join-Path $artifactDir $packageName)
+
+          $copied = Get-Item -LiteralPath (Join-Path $artifactDir $packageName)
+          $hash = (Get-FileHash -LiteralPath $copied.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          [System.IO.File]::WriteAllText((Join-Path $artifactDir 'SHA256SUMS'), "$hash  $packageName`n")
+
+      - name: Upload preview artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: testnet-wallet-preview-${{ matrix.slug }}
+          path: ${{ runner.temp }}/artifacts/${{ matrix.slug }}
+          if-no-files-found: error
+          retention-days: 14

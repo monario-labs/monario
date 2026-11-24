@@ -3,7 +3,7 @@
 //! Only public selectors (paths, wallet/node ids, revisions) are persisted.
 //! Passwords never touch disk here. Request and manifest files are created as
 //! private regular files under directories the CLI already trusts.
-use crate::backend::{ChainSource, Network, NodeRef, OFFICIAL_POOL_ADDRESS, PoolMode, WalletRef};
+use crate::backend::{ChainSource, Network, NodeRef, PoolMode, WalletRef};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -12,10 +12,33 @@ const MAX_CONFIG: u64 = 64 * 1024;
 const MAX_REQUEST: usize = 64 * 1024;
 const MAX_MANIFEST: usize = 6 * 1024;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Appearance {
+    Light,
+    Dark,
+    #[default]
+    #[serde(other)]
+    System,
+}
+
+impl Appearance {
+    pub const ALL: [Self; 3] = [Self::System, Self::Light, Self::Dark];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::System => "System",
+            Self::Light => "Light",
+            Self::Dark => "Dark",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PersistedState {
     pub version: u32,
+    pub appearance: Appearance,
     pub wallet: Option<WalletRef>,
     pub node: Option<NodeRef>,
     pub source: ChainSource,
@@ -32,9 +55,7 @@ pub struct PersistedState {
     pub mining_network_enabled: bool,
     pub mining_pool_mode: PoolMode,
     pub mining_pool_address: String,
-    pub mining_pool_public_key: String,
-    pub mining_pool_client: String,
-    pub mining_pool_token_file: String,
+    pub mining_pool_port: String,
     /// Remote scan page bootstrap (no wallet or password).
     pub remote_address: String,
     pub remote_token_file: String,
@@ -48,6 +69,7 @@ impl Default for PersistedState {
     fn default() -> Self {
         Self {
             version: CONFIG_VERSION,
+            appearance: Appearance::default(),
             wallet: None,
             node: None,
             source: ChainSource::default(),
@@ -62,10 +84,8 @@ impl Default for PersistedState {
             mining_network: Network::Test,
             mining_network_enabled: false,
             mining_pool_mode: PoolMode::Solo,
-            mining_pool_address: OFFICIAL_POOL_ADDRESS.to_owned(),
-            mining_pool_public_key: String::new(),
-            mining_pool_client: String::new(),
-            mining_pool_token_file: String::new(),
+            mining_pool_address: String::new(),
+            mining_pool_port: String::new(),
             remote_address: "127.0.0.1:19445".into(),
             remote_token_file: "scan.token".into(),
             remote_public_key: String::new(),
@@ -101,6 +121,7 @@ impl PersistedState {
             Self::default()
         };
         next.mining_network = network;
+        next.appearance = self.appearance;
         next.save_to(active)?;
         Ok(next)
     }
@@ -156,10 +177,8 @@ fn sanitize(state: &mut PersistedState) {
         state.mining_address.clear();
         state.mining_network_enabled = false;
         state.mining_pool_mode = PoolMode::Solo;
-        state.mining_pool_address = OFFICIAL_POOL_ADDRESS.to_owned();
-        state.mining_pool_public_key.clear();
-        state.mining_pool_client.clear();
-        state.mining_pool_token_file.clear();
+        state.mining_pool_address.clear();
+        state.mining_pool_port.clear();
     }
     if state.source.external > 10_000 {
         state.source.external = 10_000;
@@ -177,22 +196,18 @@ fn sanitize(state: &mut PersistedState) {
     if !(1..=crate::backend::MAX_WORKERS).contains(&state.mining_workers) {
         state.mining_workers = 1;
     }
-    if state.mining_pool_mode == PoolMode::Official
-        && state.mining_pool_address != OFFICIAL_POOL_ADDRESS
+    if state.mining_pool_address.len() > 255 || state.mining_pool_port.len() > 5 {
+        state.mining_pool_address.clear();
+        state.mining_pool_port.clear();
+    }
+    // Older custom profiles stored the hostname and port together. Public
+    // endpoint data can carry over; the new credential is supplied per launch.
+    if state.mining_pool_port.is_empty()
+        && crate::backend::validate_pool_endpoint(&state.mining_pool_address).is_ok()
+        && let Some((host, port)) = state.mining_pool_address.rsplit_once(':')
     {
-        state.mining_pool_address = OFFICIAL_POOL_ADDRESS.to_owned();
-    }
-    if state.mining_pool_address.len() > 255 {
-        state.mining_pool_address = OFFICIAL_POOL_ADDRESS.to_owned();
-    }
-    if state.mining_pool_public_key.len() > 64 {
-        state.mining_pool_public_key.clear();
-    }
-    if state.mining_pool_client.len() > 32 {
-        state.mining_pool_client.clear();
-    }
-    if state.mining_pool_token_file.len() > 64 {
-        state.mining_pool_token_file.clear();
+        state.mining_pool_port = port.to_owned();
+        state.mining_pool_address = host.trim_start_matches('[').trim_end_matches(']').to_owned();
     }
     if state.remote_address.len() > 255 {
         state.remote_address = "127.0.0.1:19445".into();
@@ -476,24 +491,60 @@ mod tests {
     }
 
     #[test]
+    fn existing_settings_default_to_system_appearance() {
+        for json in [
+            r#"{"version":1,"mining_workers":3}"#,
+            r#"{"version":1,"mining_workers":3,"appearance":"future-mode"}"#,
+        ] {
+            let loaded: PersistedState = serde_json::from_str(json).unwrap();
+            assert_eq!(loaded.appearance, Appearance::System);
+            assert_eq!(loaded.mining_workers, 3);
+        }
+    }
+
+    #[test]
+    fn legacy_pool_settings_do_not_enable_a_removed_preset() {
+        let mut removed: PersistedState =
+            serde_json::from_str(r#"{"mining_pool_mode":"official","mining_workers":4}"#).unwrap();
+        sanitize(&mut removed);
+        assert_eq!(removed.mining_pool_mode, PoolMode::Solo);
+        assert_eq!(removed.mining_workers, 4);
+        let mut custom: PersistedState = serde_json::from_str(
+            r#"{"mining_pool_mode":"custom","mining_pool_address":"[2001:db8::1]:19444"}"#,
+        )
+        .unwrap();
+        sanitize(&mut custom);
+        assert_eq!(custom.mining_pool_mode, PoolMode::Custom);
+        assert_eq!(custom.mining_pool_address, "2001:db8::1");
+        assert_eq!(custom.mining_pool_port, "19444");
+    }
+
+    #[test]
     fn network_switch_preserves_isolated_profiles() {
         let dir = root("networks");
         let active = dir.join("wallet-gui.json");
         let mut test = PersistedState::default();
         assert_eq!(test.network(), Network::Test);
+        assert_eq!(test.appearance, Appearance::System);
+        test.appearance = Appearance::Dark;
         test.source.profile = "11".repeat(32);
         test.mining_address = "test address".into();
         let mut main = test.switch_network_at(&active, Network::Main).unwrap();
         assert_eq!(main.network(), Network::Main);
         assert!(main.source.profile.is_empty());
         assert!(main.mining_address.is_empty());
+        assert_eq!(main.appearance, Appearance::Dark);
+        main.appearance = Appearance::Light;
         main.source.profile = "22".repeat(32);
         let restored = main.switch_network_at(&active, Network::Test).unwrap();
         assert_eq!(restored.source.profile, test.source.profile);
         assert_eq!(restored.mining_address, test.mining_address);
+        assert_eq!(restored.appearance, Appearance::Light);
         let restored = restored.switch_network_at(&active, Network::Main).unwrap();
         assert_eq!(restored.source.profile, main.source.profile);
-        assert_eq!(PersistedState::load_from(&active).network(), Network::Main);
+        let reopened = PersistedState::load_from(&active);
+        assert_eq!(reopened.network(), Network::Main);
+        assert_eq!(reopened.appearance, Appearance::Light);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

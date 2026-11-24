@@ -1,5 +1,11 @@
 use super::*;
 
+/// Fixed valid vectors from `crates/address/tests/vectors.txt`.
+const SOLO_REGTEST: &str = "rmont1qyqqqqgzqvzq2ps8pqys5zcvp58q7yq3zgfs7grwe7";
+const SOLO_TEST: &str = "testmont1qyqqqqgzqvzq2ps8pqys5zcvp58q7yq3zgfsxp6xum";
+const SOLO_REGTEST_PRIVATE: &str =
+    "rmonz1qypgluecd9cuke9cuaufjzxa367hm6f2drjcdg6dhrl2nx006gqkltnkw5904elwjstyd09ey8n3q4";
+
 fn pw(value: &str) -> Zeroizing<String> {
     Zeroizing::new(value.to_owned())
 }
@@ -133,7 +139,7 @@ fn passwords_never_reach_arguments() {
             "gui-status.json",
             "gui.stop",
             &MiningConfig {
-                address: "rmont1example".into(),
+                address: SOLO_REGTEST.into(),
                 workers: 2,
                 network: Network::Regtest,
                 pool_mode: PoolMode::Solo,
@@ -238,7 +244,7 @@ fn wallet_commands_carry_the_exact_public_selector() {
 #[test]
 fn node_activation_is_always_explicit() {
     let mining = MiningConfig {
-        address: "testmont1example".into(),
+        address: SOLO_TEST.into(),
         workers: 3,
         network: Network::Test,
         pool_mode: PoolMode::Solo,
@@ -285,7 +291,7 @@ fn node_activation_is_always_explicit() {
         .is_err()
     );
     let mut bad_stop = mining.clone();
-    bad_stop.address = "testmont1example".into();
+    bad_stop.address = SOLO_TEST.into();
     assert!(
         node_mine(
             &node(),
@@ -315,126 +321,64 @@ fn node_activation_is_always_explicit() {
 }
 
 #[test]
-fn pool_modes_build_bounded_flags_and_reject_missing_credentials() {
-    let pool = PoolSpec {
-        address: OFFICIAL_POOL_ADDRESS.into(),
-        public_key: "11".repeat(32),
-        client: "22".repeat(16),
-        token_file: "pool.token".into(),
-    };
-    let mut official = MiningConfig {
-        address: "testmont1example".into(),
-        workers: 1,
+fn custom_pool_passes_credentials_on_stdin_only() {
+    let token = "33".repeat(32);
+    let credential = Zeroizing::new(format!(
+        "monp1:{}:{}:{token}",
+        "11".repeat(32),
+        "22".repeat(16)
+    ));
+    let mut setup = MiningConfig {
+        address: String::new(),
+        workers: 12,
         network: Network::Test,
-        pool_mode: PoolMode::Official,
-        pool: Some(pool.clone()),
+        pool_mode: PoolMode::Custom,
+        pool: Some(PoolSpec {
+            address: pool_endpoint("2001:db8::1", "19444").unwrap(),
+            credential: &credential,
+        }),
     };
+    let password = pw("aaaaaaaaaaaa");
     let spec = node_mine(
         &node(),
         "chain.json",
         "",
         "gui-status.json",
         "gui.stop",
-        &official,
+        &setup,
         false,
-        &pw("aaaaaaaaaaaa"),
-    )
-    .unwrap();
-    assert!(
-        spec.args
-            .windows(2)
-            .any(|w| w[0] == "--pool-mode" && w[1] == "official")
-    );
-    assert!(!spec.args.iter().any(|arg| arg == "--pool-address"));
-    assert!(
-        spec.args
-            .windows(2)
-            .any(|w| w == ["--miner-network", "test"])
-    );
-    assert!(!spec.args.iter().any(|arg| arg == "--enable-network"));
-    assert!(
-        spec.args
-            .windows(2)
-            .any(|w| w[0] == "--pool-token-file" && w[1] == "pool.token")
-    );
-
-    let mut custom = official.clone();
-    custom.pool_mode = PoolMode::Custom;
-    custom.pool.as_mut().unwrap().address = "127.0.0.1:1234".into();
-    let spec = node_mine(
-        &node(),
-        "chain.json",
-        "",
-        "gui-status.json",
-        "gui.stop",
-        &custom,
-        false,
-        &pw("aaaaaaaaaaaa"),
+        &password,
     )
     .unwrap();
     assert!(spec.args.windows(2).any(|w| w == ["--pool-mode", "custom"]));
-    assert!(!spec.args.iter().any(|arg| arg == "--enable-network"));
     assert!(
         spec.args
             .windows(2)
-            .any(|w| w[0] == "--pool-address" && w[1] == "127.0.0.1:1234")
+            .any(|w| w == ["--pool-address", "[2001:db8::1]:19444"])
     );
-
-    // Solo must not carry credentials.
-    let mut solo = custom.clone();
-    solo.pool_mode = PoolMode::Solo;
+    assert!(spec.args.windows(2).any(|w| w == ["--miner-workers", "12"]));
+    assert!(spec.args.iter().any(|arg| arg == "--pool-credential-stdin"));
     assert!(
-        node_mine(
-            &node(),
-            "chain.json",
-            "",
-            "gui-status.json",
-            "gui.stop",
-            &solo,
-            false,
-            &pw("aaaaaaaaaaaa"),
-        )
-        .is_err()
+        !spec.args.iter().any(|arg| arg == "--enable-network"
+            || arg == "--miner-address"
+            || arg.contains(&token))
     );
-    // A pool mode without credentials fails closed.
-    let mut missing = custom.clone();
-    missing.pool = None;
-    assert!(
-        node_mine(
-            &node(),
-            "chain.json",
-            "",
-            "gui-status.json",
-            "gui.stop",
-            &missing,
-            false,
-            &pw("aaaaaaaaaaaa"),
-        )
-        .is_err()
+    assert!(!format!("{spec:?}").contains(&token));
+    let frames = spec.stdin().unwrap();
+    let after_password = 2 + password.len();
+    assert_eq!(
+        &frames[after_password..after_password + 2],
+        &(credential.len() as u16).to_le_bytes()
     );
-    // Bounded credential and endpoint encodings.
-    for (field, value, valid) in [
-        ("_public", "jj".repeat(32), false),
-        ("_public", "11".repeat(31), false),
-        ("_client", "zz".repeat(16), false),
-        ("_token", "pool.json".into(), false),
-        ("_address", "127.0.0.1:0".into(), false),
-        ("_address", "no-port".into(), false),
-        ("_address", "127.0.0.1:1234".into(), true),
-    ] {
-        let mut config = custom.clone();
-        let pool = config.pool.as_mut().unwrap();
-        match field {
-            "_public" => pool.public_key = value.clone(),
-            "_client" => pool.client = value.clone(),
-            "_token" => pool.token_file = value.clone(),
-            _ => pool.address = value.clone(),
-        }
-        assert_eq!(config.validate().is_ok(), valid, "{field}:{value}");
-    }
-    // The official host is fixed; a different address is rejected.
-    official.pool.as_mut().unwrap().address = "127.0.0.1:1234".into();
-    assert!(official.validate().is_err());
+    assert_eq!(&frames[after_password + 2..], credential.as_bytes());
+    setup.pool_mode = PoolMode::Solo;
+    assert!(setup.validate().is_err());
+    setup.pool_mode = PoolMode::Custom;
+    setup.pool = None;
+    assert!(setup.validate().is_err());
+    assert!(validate_pool_credential("regular-password").is_err());
+    assert!(pool_endpoint("host", "0").is_err());
+    assert!(pool_endpoint("https://example.org", "19444").is_err());
 }
 
 #[test]
@@ -603,6 +547,104 @@ fn status_snapshots_are_bounded_and_typed() {
     std::fs::write(&path, b"not json").unwrap();
     assert!(read_status(&path).is_err());
     std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn pool_phase_status_is_optional_and_rejection_is_typed() {
+    let root = std::env::temp_dir().join(format!("monario-gui-pool-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("status.json");
+    // An older node snapshot without a phase still parses.
+    std::fs::write(
+        &path,
+        br#"{"version":1,"profile":"aa","tip":"bb","height":"1","peers":0,"stopped":false,"updated_unix":1,"pool":{"connected":true,"assigned":false,"workers":0,"submitted":0,"block_candidates":0}}"#,
+    )
+    .unwrap();
+    let status = read_status(&path).unwrap();
+    let pool = status.pool.unwrap();
+    assert_eq!(pool.phase, None);
+    assert!(pool.connected);
+    assert_eq!(status.pid, None);
+
+    std::fs::write(
+        &path,
+        br#"{"version":1,"pid":4242,"profile":"aa","tip":"bb","height":"1","peers":0,"stopped":false,"updated_unix":1,"pool":{"connected":false,"phase":"rejected","assigned":false,"workers":0,"submitted":0,"block_candidates":0}}"#,
+    )
+    .unwrap();
+    let status = read_status(&path).unwrap();
+    assert_eq!(status.pid, Some(4242));
+    assert_eq!(
+        status.pool.unwrap().phase,
+        Some(PoolPhase::Rejected)
+    );
+    assert!(!POOL_AUTH_REJECTED.is_empty());
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn managed_node_status_ignores_snapshots_from_another_pid() {
+    let root = std::env::temp_dir().join(format!("monario-gui-pid-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("status.json");
+    let node = ManagedNode {
+        child: None,
+        status_path: path.clone(),
+        stop_path: root.join("gui.stop"),
+        stdout: Arc::new(Mutex::new(String::new())),
+        stderr: Arc::new(Mutex::new(String::new())),
+        pid: 4242,
+    };
+    // A snapshot from a different process is not accepted.
+    std::fs::write(
+        &path,
+        br#"{"version":1,"pid":1111,"profile":"aa","tip":"bb","height":"1","peers":0,"stopped":false,"updated_unix":1}"#,
+    )
+    .unwrap();
+    assert!(node.status().is_err());
+    // The matching process and older snapshots without a pid are accepted.
+    std::fs::write(
+        &path,
+        br#"{"version":1,"pid":4242,"profile":"aa","tip":"bb","height":"1","peers":0,"stopped":false,"updated_unix":1}"#,
+    )
+    .unwrap();
+    assert_eq!(node.status().unwrap().pid, Some(4242));
+    std::fs::write(
+        &path,
+        br#"{"version":1,"profile":"aa","tip":"bb","height":"1","peers":0,"stopped":false,"updated_unix":1}"#,
+    )
+    .unwrap();
+    assert_eq!(node.status().unwrap().pid, None);
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn solo_payout_address_needs_matching_network_and_transparent_receiver() {
+    assert!(validate_solo_address(SOLO_REGTEST, Network::Regtest).is_ok());
+    assert!(validate_solo_address(SOLO_TEST, Network::Test).is_ok());
+    assert!(validate_solo_address(SOLO_REGTEST, Network::Test).is_err());
+    assert!(validate_solo_address(SOLO_TEST, Network::Main).is_err());
+    assert!(validate_solo_address(SOLO_REGTEST_PRIVATE, Network::Regtest).is_err());
+    assert!(validate_solo_address("rmont1fixture", Network::Regtest).is_err());
+    assert!(validate_solo_address("", Network::Regtest).is_err());
+    // Pool payouts stay operator-configured; pool mode must not require a solo
+    // address and must not decode it.
+    let credential = Zeroizing::new(format!(
+        "monp1:{}:{}:{}",
+        "11".repeat(32),
+        "22".repeat(16),
+        "33".repeat(32)
+    ));
+    let pool = MiningConfig {
+        address: "rmont1fixture".into(),
+        workers: 1,
+        network: Network::Regtest,
+        pool_mode: PoolMode::Custom,
+        pool: Some(PoolSpec {
+            address: pool_endpoint("pool.example", "19444").unwrap(),
+            credential: &credential,
+        }),
+    };
+    pool.validate().unwrap();
 }
 
 #[test]

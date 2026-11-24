@@ -12,11 +12,12 @@ jobs before switching. Each network needs its own wallet and validated chain.
 This preview includes only the testnet manifest and root record.
 
 The Mining screen supports solo CPU mining and authenticated Monario pools.
-Set up and sync a compatible node first. For solo mining, use a transparent
-coinbase address for the active network. Pool mining requires an endpoint, a
-pinned pool public key, a client ID, and a token file from the operator. The
-official hostname is a preset. This bundle supplies neither a working pool nor
-pool credentials. The GUI starts work only after an explicit action.
+Set up and sync a compatible node first. Solo mining requires that node and a
+transparent payout address matching the active network. Custom pool mining takes
+the pool host or IP, port, and a credential from the operator that ties your
+authenticated identity to that pool; register your payout address with the
+operator. No pool preset, credentials, or working pool are bundled. Mining starts
+only after an explicit action.
 
 ## Build and verify a native package
 

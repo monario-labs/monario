@@ -2234,6 +2234,7 @@ name = "monario-wallet-gui"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "monario-address",
  "monario-randomx",
  "serde",
  "serde_json",
