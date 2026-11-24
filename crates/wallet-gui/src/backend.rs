@@ -17,8 +17,9 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+pub use monario_randomx::MAX_WORKERS;
+
 pub const ATOMS_PER_MONAR: u64 = 100_000_000;
-pub const MAX_WORKERS: u8 = 4;
 pub const MAX_ARG_BYTES: usize = 4096;
 pub const MAX_ARGS: usize = 48;
 pub const MAX_OUTPUT_BYTES: usize = 256 * 1024;

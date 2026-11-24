@@ -788,12 +788,28 @@ impl GuiApp {
         }
     }
 
+    fn cached_mining_worker_limit(ui: &egui::Ui) -> u8 {
+        let id = egui::Id::new("mining-worker-limit");
+        let now = std::time::Instant::now();
+        ui.ctx().memory_mut(|memory| {
+            if let Some((stamp, limit)) = memory.data.get_temp::<(std::time::Instant, u8)>(id) {
+                if now.saturating_duration_since(stamp) < std::time::Duration::from_secs(1) {
+                    return limit;
+                }
+            }
+            let limit = monario_randomx::mining_worker_limit();
+            memory.data.insert_temp(id, (now, limit));
+            limit
+        })
+    }
+
     pub(crate) fn mining(&mut self, ui: &mut egui::Ui) {
+        let worker_limit = Self::cached_mining_worker_limit(ui);
         page_header(
             ui,
             "WORKSPACE / MINING",
             "Mine MONAR",
-            "Choose solo or pool mining. Each RandomX worker uses a 256 MiB cache.",
+            "Choose solo or pool mining. RandomX uses a shared 256 MiB cache plus a 2 MiB scratchpad per worker.",
         );
         let busy = self.is_busy();
         let running = self.node_kind == Some(NodeKind::Mine);
@@ -813,13 +829,28 @@ impl GuiApp {
             theme::field(ui, &mut self.state.mining_address, prefix);
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.add(egui::Slider::new(&mut self.state.mining_workers, 1..=4).text("workers"));
+                ui.add_enabled(
+                    worker_limit > 0,
+                    egui::Slider::new(&mut self.state.mining_workers, 1..=worker_limit.max(1))
+                        .text("workers")
+                        .clamping(egui::SliderClamping::Edits),
+                );
                 ui.add_space(10.0);
                 ui.label(theme::caption(&format!(
-                    "≈ {} MiB cache",
-                    u32::from(self.state.mining_workers) * 256
+                    "≈ 256 MiB shared cache + {} MiB scratchpad",
+                    u32::from(self.state.mining_workers) * 2
                 )));
             });
+            if worker_limit == 0 {
+                ui.label(theme::caption(
+                    "Insufficient available memory to mine. Free memory and try again.",
+                ));
+            } else if self.state.mining_workers > worker_limit {
+                ui.label(theme::caption(&format!(
+                    "Configured {} workers is above the current maximum of {worker_limit}.",
+                    self.state.mining_workers
+                )));
+            }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label(theme::caption("Miner network"));
@@ -890,7 +921,8 @@ impl GuiApp {
                         !busy
                             && self.node.is_none()
                             && node_ready
-                            && !self.state.mining_address.trim().is_empty(),
+                            && !self.state.mining_address.trim().is_empty()
+                            && self.state.mining_workers <= worker_limit,
                         theme::button_primary("Start mining"),
                     )
                     .clicked()

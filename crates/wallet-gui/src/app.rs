@@ -1107,6 +1107,14 @@ impl GuiApp {
                 &self.password,
             ),
             NodeKind::Mine => {
+                let worker_limit = monario_randomx::mining_worker_limit();
+                if self.state.mining_workers > worker_limit {
+                    self.error(format!(
+                        "configured {} mining workers exceed the current limit of {worker_limit}; lower workers on the Mining page",
+                        self.state.mining_workers
+                    ));
+                    return;
+                }
                 let mining = MiningConfig {
                     address: self.state.mining_address.trim().to_owned(),
                     workers: self.state.mining_workers,

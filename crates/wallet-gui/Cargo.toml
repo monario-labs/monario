@@ -15,6 +15,7 @@ path = "src/lib.rs"
 
 [dependencies]
 eframe = { version = "=0.31.1", default-features = false, features = ["default_fonts", "glow"] }
+monario-randomx = { path = "../randomx" }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 zeroize = "=1.9.1"

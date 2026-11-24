@@ -11,6 +11,7 @@ pub enum Error {
     Exhausted,
     Hash(monario_randomx::Error),
     JobMismatch,
+    CacheUnavailable,
     ShareTarget,
     Submit(super::Error),
 }
@@ -51,6 +52,22 @@ impl<'a> Miner<'a> {
         }
         let verifier =
             monario_randomx::Verifier::with_mode(&work.seed(), mode).map_err(Error::Hash)?;
+        Self::with_verifier(work, start, end, verifier)
+    }
+
+    /// Reuse a caller-provided light cache, rejecting a verifier for another seed.
+    pub(crate) fn with_verifier(
+        work: &'a Work,
+        start: u64,
+        end: u64,
+        verifier: monario_randomx::Verifier,
+    ) -> Result<Self, Error> {
+        if start > end {
+            return Err(Error::Exhausted);
+        }
+        if verifier.seed() != work.seed() {
+            return Err(Error::JobMismatch);
+        }
         Ok(Self {
             work,
             verifier,
@@ -80,7 +97,32 @@ impl<'a> Miner<'a> {
         {
             return Err(Error::ShareTarget);
         }
-        let mut worker = Self::new(work, start, end, mode)?;
+        if start > end {
+            return Err(Error::Exhausted);
+        }
+        let verifier =
+            monario_randomx::Verifier::with_mode(&work.seed(), mode).map_err(Error::Hash)?;
+        Self::with_pool_verifier(work, start, end, prefix, share_target, verifier)
+    }
+
+    /// Search a pool-assigned partition with a caller-provided light cache.
+    pub(crate) fn with_pool_verifier(
+        work: &'a Work,
+        start: u64,
+        end: u64,
+        prefix: [u8; 24],
+        share_target: [u8; 32],
+        verifier: monario_randomx::Verifier,
+    ) -> Result<Self, Error> {
+        if share_target
+            .iter()
+            .rev()
+            .cmp(work.target_le().iter().rev())
+            .is_lt()
+        {
+            return Err(Error::ShareTarget);
+        }
+        let mut worker = Self::with_verifier(work, start, end, verifier)?;
         worker.prefix = prefix;
         worker.target = share_target;
         Ok(worker)

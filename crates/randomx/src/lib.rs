@@ -1,6 +1,9 @@
 //! Pinned RandomX v2.0.1 light-mode verifier. No mining loop or dataset allocation.
-//! Each instance owns one 256 MiB cache and one VM and is neither Send nor Sync.
-use std::{ffi::c_void, marker::PhantomData, ptr::NonNull, rc::Rc};
+//! Initialized caches can be shared. Virtual machines remain thread-local.
+use std::{ffi::c_void, marker::PhantomData, ptr::NonNull, rc::Rc, sync::Arc};
+
+mod resources;
+pub use resources::{MAX_WORKERS, mining_worker_limit};
 
 const V2: u32 = 128;
 /// Execution choices with identical consensus results; no caller-controlled flags.
@@ -42,13 +45,64 @@ impl std::fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 
-struct Cache(NonNull<c_void>);
+struct Cache {
+    raw: NonNull<c_void>,
+    seed: Vec<u8>,
+}
+
+// SAFETY: initialization completes before publishing Cache. This wrapper never invokes
+// randomx_init_cache again or exposes the pointer. The vendored light VMs only read
+// the cache's memory and metadata and allocate their own scratchpad and JIT state.
+unsafe impl Send for Cache {}
+// SAFETY: the same immutable-cache invariant applies to concurrent light VMs.
+unsafe impl Sync for Cache {}
+
 impl Drop for Cache {
     fn drop(&mut self) {
-        // SAFETY: this is the unique cache owner; the VM is destroyed first.
-        unsafe {
-            randomx_release_cache(self.0.as_ptr());
+        // SAFETY: the last Arc was released after every associated VM was destroyed.
+        unsafe { randomx_release_cache(self.raw.as_ptr()) }
+    }
+}
+
+/// An immutable, initialized light cache for one seed. Initialization allocates 256 MiB.
+#[derive(Clone)]
+pub struct SharedCache(Arc<Cache>);
+
+impl SharedCache {
+    pub fn new(seed: &[u8]) -> Result<Self, Error> {
+        if seed.is_empty() || seed.len() > 64 {
+            return Err(Error::InvalidSeed);
         }
+        // SAFETY: flags 0 select the default non-JIT, light cache allocation.
+        let raw = NonNull::new(unsafe { randomx_alloc_cache(0) }).ok_or(Error::AllocationFailed)?;
+        // SAFETY: the cache is exclusively owned and the seed is live during initialization.
+        unsafe { randomx_init_cache(raw.as_ptr(), seed.as_ptr().cast(), seed.len()) };
+        Ok(Self(Arc::new(Cache {
+            raw,
+            seed: seed.to_vec(),
+        })))
+    }
+
+    pub fn seed(&self) -> &[u8] {
+        &self.0.seed
+    }
+
+    /// Create a VM on the thread where it will run.
+    pub fn verifier(&self, mode: Mode) -> Result<Verifier, Error> {
+        let flags = match mode {
+            Mode::Interpreter => V2,
+            Mode::SecureJit => V2 | 8 | 16,
+        };
+        // SAFETY: the initialized cache outlives the VM; light mode has no dataset.
+        let vm = NonNull::new(unsafe {
+            randomx_create_vm(flags, self.0.raw.as_ptr(), std::ptr::null_mut())
+        })
+        .ok_or(Error::AllocationFailed)?;
+        Ok(Verifier {
+            vm,
+            cache: self.clone(),
+            _thread_local: PhantomData,
+        })
     }
 }
 
@@ -64,8 +118,7 @@ impl Drop for Cache {
 /// ```
 pub struct Verifier {
     vm: NonNull<c_void>,
-    _cache: Cache,
-    seed: Vec<u8>,
+    cache: SharedCache,
     _thread_local: PhantomData<Rc<()>>,
 }
 impl Verifier {
@@ -75,36 +128,11 @@ impl Verifier {
     }
     /// Select the interpreter or W^X JIT. Neither mode allocates a full dataset.
     pub fn with_mode(seed: &[u8], mode: Mode) -> Result<Self, Error> {
-        if seed.is_empty() || seed.len() > 64 {
-            return Err(Error::InvalidSeed);
-        }
-        // SAFETY: flags 0 select supported, non-JIT default cache allocation.
-        let cache =
-            Cache(NonNull::new(unsafe { randomx_alloc_cache(0) }).ok_or(Error::AllocationFailed)?);
-        // SAFETY: cache is allocated; seed remains live throughout synchronous initialization.
-        unsafe {
-            randomx_init_cache(cache.0.as_ptr(), seed.as_ptr().cast(), seed.len());
-        }
-        // SAFETY: initialized cache outlives VM; null dataset is required for light mode.
-        let flags = match mode {
-            Mode::Interpreter => V2,
-            Mode::SecureJit => V2 | 8 | 16,
-        };
-        // SAFETY: only enumerated supported flags are used with the initialized cache.
-        let vm = NonNull::new(unsafe {
-            randomx_create_vm(flags, cache.0.as_ptr(), std::ptr::null_mut())
-        })
-        .ok_or(Error::AllocationFailed)?;
-        Ok(Self {
-            vm,
-            _cache: cache,
-            seed: seed.to_vec(),
-            _thread_local: PhantomData,
-        })
+        SharedCache::new(seed)?.verifier(mode)
     }
     /// The seed this cache actually contains; callers must compare branch seed identities.
     pub fn seed(&self) -> &[u8] {
-        &self.seed
+        self.cache.seed()
     }
     /// Calculate one bounded v2 digest. This never searches nonces.
     pub fn hash(&mut self, input: &[u8]) -> Result<[u8; 32], Error> {

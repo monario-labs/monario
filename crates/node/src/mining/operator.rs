@@ -11,7 +11,7 @@ use monario_chain::Hash;
 use std::{
     net::SocketAddr,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver as WorkReceiver, TryRecvError},
     },
@@ -20,8 +20,8 @@ use std::{
 };
 use zeroize::Zeroizing;
 
-/// Each worker owns a 256 MiB RandomX cache; keep the process bound explicit.
-pub const MAX_WORKERS: u8 = 4;
+/// Process-wide worker bound. Workers share a single 256 MiB RandomX cache.
+pub use monario_randomx::MAX_WORKERS;
 /// Published default for the official pool. Provisional: it is a name default,
 /// authenticated by the configured pool key. It is not an implicit trust anchor
 /// and this constant asserts no live service.
@@ -36,7 +36,7 @@ const MAX_EXTRA_DATA: usize = 98;
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     pub network: Network,
-    /// Inclusive 1..=4. Every worker allocates its own RandomX cache.
+    /// Inclusive 1..=MAX_WORKERS. Workers share one RandomX cache.
     pub workers: u8,
     /// Minimum monotonic interval between validated job refreshes.
     pub poll_ms: u64,
@@ -80,6 +80,34 @@ trait Search: Send + Sync {
 
 struct CpuSearch {
     mode: monario_randomx::Mode,
+    cache: Mutex<Option<monario_randomx::SharedCache>>,
+}
+
+impl CpuSearch {
+    fn new(mode: monario_randomx::Mode) -> Self {
+        Self {
+            mode,
+            cache: Mutex::new(None),
+        }
+    }
+
+    fn verifier(&self, work: &Work) -> Result<monario_randomx::Verifier, cpu::Error> {
+        let seed = work.seed();
+        let cache = {
+            let mut slot = self.cache.lock().map_err(|_| cpu::Error::CacheUnavailable)?;
+            let current = slot
+                .as_ref()
+                .map(|cache| cache.seed() == seed)
+                .unwrap_or(false);
+            if !current {
+                *slot = None;
+                *slot =
+                    Some(monario_randomx::SharedCache::new(&seed).map_err(cpu::Error::Hash)?);
+            }
+            slot.clone().ok_or(cpu::Error::CacheUnavailable)?
+        };
+        cache.verifier(self.mode).map_err(cpu::Error::Hash)
+    }
 }
 
 impl Search for CpuSearch {
@@ -90,7 +118,10 @@ impl Search for CpuSearch {
         end: u64,
         cancel: &AtomicBool,
     ) -> Result<Option<cpu::Solution>, cpu::Error> {
-        let mut miner = cpu::Miner::new(work, start, end, self.mode)?;
+        if cancel.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let mut miner = cpu::Miner::with_verifier(work, start, end, self.verifier(work)?)?;
         loop {
             match miner.search_batch(cpu::MAX_BATCH, cancel)? {
                 cpu::Batch::Found(solution) => return Ok(Some(solution)),
@@ -144,7 +175,7 @@ impl Operator {
         Ok(Self::with_backend(
             config,
             refresh::Manager::new(address, config.network, extra_data),
-            Arc::new(CpuSearch { mode: config.mode }),
+            Arc::new(CpuSearch::new(config.mode)),
         ))
     }
 
@@ -398,11 +429,7 @@ trait PoolSearch: Send + Sync {
     ) -> Result<Option<[u8; 32]>, cpu::Error>;
 }
 
-struct CpuPoolSearch {
-    mode: monario_randomx::Mode,
-}
-
-impl PoolSearch for CpuPoolSearch {
+impl PoolSearch for CpuSearch {
     fn search(
         &self,
         work: &Work,
@@ -412,7 +439,17 @@ impl PoolSearch for CpuPoolSearch {
         target: [u8; 32],
         cancel: &AtomicBool,
     ) -> Result<Option<[u8; 32]>, cpu::Error> {
-        let mut miner = cpu::Miner::new_pool(work, start, end, prefix, target, self.mode)?;
+        if cancel.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let mut miner = cpu::Miner::with_pool_verifier(
+            work,
+            start,
+            end,
+            prefix,
+            target,
+            self.verifier(work)?,
+        )?;
         loop {
             match miner.search_batch(cpu::MAX_BATCH, cancel)? {
                 cpu::Batch::Found(solution) => return Ok(Some(solution.nonce)),
@@ -434,7 +471,7 @@ pub struct PoolOperatorConfig {
     pub profile: [u8; 32],
     pub client: [u8; 16],
     pub token: Zeroizing<[u8; 32]>,
-    /// Inclusive 1..=4. Every worker allocates its own 256 MiB RandomX cache.
+    /// Inclusive 1..=MAX_WORKERS. Workers share one 256 MiB RandomX cache.
     pub workers: u8,
     /// Minimum monotonic interval between pool polls.
     pub poll_ms: u64,
@@ -505,7 +542,7 @@ impl PoolOperator {
             job: None,
             workers: Vec::new(),
             events: None,
-            backend: Arc::new(CpuPoolSearch { mode: config.mode }),
+            backend: Arc::new(CpuSearch::new(config.mode)),
             submitted: 0,
             block_candidates: 0,
             last_poll: None,

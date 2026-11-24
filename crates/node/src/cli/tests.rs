@@ -233,7 +233,7 @@ fn mining_is_explicit_bounded_and_never_implies_network_activation() {
     without_activation.remove(index);
     assert!(Command::parse(without_activation.into_iter().map(OsString::from)).is_err());
 
-    for workers in ["0", "5", "18446744073709551616"] {
+    for workers in ["0", "129", "18446744073709551616"] {
         let mut invalid = mine.clone();
         let index = invalid
             .iter()
@@ -243,6 +243,32 @@ fn mining_is_explicit_bounded_and_never_implies_network_activation() {
         invalid[index] = workers.into();
         assert!(Command::parse(invalid.into_iter().map(OsString::from)).is_err());
     }
+    let mut automatic = mine.clone();
+    let index = automatic
+        .iter()
+        .position(|arg| arg == "--miner-workers")
+        .unwrap()
+        + 1;
+    automatic[index] = "auto".into();
+    match Command::parse(automatic.into_iter().map(OsString::from)) {
+        Ok(command) => {
+            let workers = command.mining.as_ref().unwrap().workers;
+            assert!((1..=monario_randomx::MAX_WORKERS).contains(&workers));
+        }
+        Err(Error::MiningCapacity) => {}
+        Err(error) => panic!("unexpected error parsing --miner-workers auto: {error:?}"),
+    }
+    let mut shared_maximum = mine.clone();
+    let index = shared_maximum
+        .iter()
+        .position(|arg| arg == "--miner-workers")
+        .unwrap()
+        + 1;
+    shared_maximum[index] = monario_randomx::MAX_WORKERS.to_string();
+    assert_eq!(
+        parse(shared_maximum).mining.as_ref().unwrap().workers,
+        monario_randomx::MAX_WORKERS
+    );
     for network in ["mainnet", "testnet", "Regtest", ""] {
         let mut invalid = mine.clone();
         let index = invalid

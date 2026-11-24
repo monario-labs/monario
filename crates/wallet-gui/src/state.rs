@@ -466,7 +466,7 @@ mod tests {
             ..PersistedState::default()
         };
         state.source.external = 99_999;
-        state.mining_workers = 9;
+        state.mining_workers = crate::backend::MAX_WORKERS + 1;
         state.save_to(&path).unwrap();
         let loaded = PersistedState::load_from(&path);
         assert_eq!(loaded.wallet.as_ref().unwrap().name, "primary");

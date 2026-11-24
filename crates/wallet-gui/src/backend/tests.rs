@@ -270,7 +270,7 @@ fn node_activation_is_always_explicit() {
     assert!(spec.args.iter().any(|arg| arg == "gui.stop"));
 
     let mut workers = mining.clone();
-    workers.workers = 5;
+    workers.workers = MAX_WORKERS + 1;
     assert!(
         node_mine(
             &node(),
