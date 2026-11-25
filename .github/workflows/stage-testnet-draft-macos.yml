@@ -1,4 +1,4 @@
-name: stage testnet draft macos
+name: Stage testnet draft wallet assets
 
 on:
   push:
@@ -27,9 +27,9 @@ jobs:
           RELEASE_API="repos/${REPO}/releases/${RELEASE_ID}"
           UPLOAD_API="https://uploads.github.com/repos/${REPO}/releases/${RELEASE_ID}/assets"
           OLD_COMMIT="d66f71b50f50363f5461ae4bbafb2fe7ada980d8"
-          NEW_COMMIT="0e3981fe60761ab5b2e92edb57519e8f3f76cd49"
-          RUN_ID="45515055825"
-          SUFFIX="-0e3981f"
+          NEW_COMMIT="40c55482006e185cd3c0af774040e7b2ff7243c2"
+          RUN_ID="45515544053"
+          SUFFIX="-40c5548"
           SUMS_NAME="SHA256SUMS${SUFFIX}"
 
           WORK="$(mktemp -d)"
