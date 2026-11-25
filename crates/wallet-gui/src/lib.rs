@@ -10,6 +10,7 @@ pub mod backend;
 pub mod pages;
 pub mod state;
 pub mod theme;
+mod wallet_tools;
 
 use eframe::egui;
 

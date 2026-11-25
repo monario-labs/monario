@@ -97,7 +97,8 @@ jobs:
           Invoke-Native @('cargo', 'fetch', '--locked', '--target', $env:EXPECTED_HOST)
           $env:CARGO_NET_OFFLINE = 'true'
 
-          Invoke-Native @('cargo', 'test', '--locked', '--offline', '-p', 'monario-wallet-gui', '--lib', '--', 'node_activation_is_always_explicit', 'solo_payout_address_needs_matching_network_and_transparent_receiver', 'custom_pool_passes_credentials_on_stdin_only', 'custom_mining_shows_pool_connection_fields_without_a_preset', 'pool_phase_status_is_optional_and_rejection_is_typed')
+          Invoke-Native @('cargo', 'test', '--locked', '--offline', '-p', 'monario-wallet-gui', '--lib')
+          Invoke-Native @('cargo', 'test', '--locked', '--offline', '-p', 'monario-wallet-cli', '--lib', '--', 'message::tests', 'backup_directory_tests')
 
           Invoke-Native @($py, 'tools/verify_vendor.py')
           $env:MONARIO_PRIVATE_SCAN_FILE = $privateTerms

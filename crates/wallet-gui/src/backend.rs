@@ -27,6 +27,8 @@ pub const MAX_READ: u64 = 128 * 1024;
 const MIN_SECRET: usize = 12;
 const MAX_SECRET: usize = 1024;
 const MAX_SECRETS: usize = 3;
+const MAX_MESSAGE: usize = 4096;
+const MAX_PROOF: usize = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -131,6 +133,7 @@ pub struct CommandSpec {
     pub program: Program,
     pub args: Vec<String>,
     frames: Vec<Zeroizing<String>>,
+    payload: Option<Zeroizing<Vec<u8>>>,
 }
 
 impl std::fmt::Debug for CommandSpec {
@@ -148,6 +151,7 @@ impl CommandSpec {
             program,
             args,
             frames: Vec::new(),
+            payload: None,
         }
     }
 
@@ -156,10 +160,17 @@ impl CommandSpec {
         self
     }
 
+    /// Pre-framed private bytes written after the password frames, if any.
+    fn with_payload(mut self, payload: Zeroizing<Vec<u8>>) -> Self {
+        self.payload = Some(payload);
+        self
+    }
+
     /// Encode the CLI password framing: `u16` little-endian length followed by
-    /// the exact bytes, repeated for each secret, with EOF after the last frame.
+    /// the exact bytes, repeated for each secret, followed by any private
+    /// payload frames, with EOF after the last frame.
     pub fn stdin(&self) -> Result<Zeroizing<Vec<u8>>, BackendError> {
-        if self.frames.is_empty() || self.frames.len() > MAX_SECRETS {
+        if self.frames.len() > MAX_SECRETS || (self.frames.is_empty() && self.payload.is_none()) {
             return Err(BackendError::Invalid(
                 "an unexpected number of password frames was supplied".into(),
             ));
@@ -179,6 +190,9 @@ impl CommandSpec {
             return Err(BackendError::Invalid(
                 "password frames are too large".into(),
             ));
+        }
+        if let Some(payload) = &self.payload {
+            out.extend_from_slice(payload);
         }
         Ok(out)
     }
@@ -405,12 +419,7 @@ pub fn validate_solo_address(address: &str, network: Network) -> Result<(), Back
     if address.is_empty() || address.len() > 128 {
         return Err(BackendError::Invalid("enter a solo payout address".into()));
     }
-    let expected = match network {
-        Network::Main => monario_address::Network::Main,
-        Network::Test => monario_address::Network::Test,
-        Network::Regtest => monario_address::Network::Regtest,
-    };
-    match monario_address::Address::decode(address, expected) {
+    match monario_address::Address::decode(address, address_network(network)) {
         Ok(decoded) => match decoded.receiver() {
             monario_address::Receiver::Transparent(_) => Ok(()),
             monario_address::Receiver::Private(_) => Err(BackendError::Invalid(
@@ -419,6 +428,35 @@ pub fn validate_solo_address(address: &str, network: Network) -> Result<(), Back
         },
         Err(_) => Err(BackendError::Invalid(
             "invalid solo payout address for the selected network".into(),
+        )),
+    }
+}
+
+fn address_network(network: Network) -> monario_address::Network {
+    match network {
+        Network::Main => monario_address::Network::Main,
+        Network::Test => monario_address::Network::Test,
+        Network::Regtest => monario_address::Network::Regtest,
+    }
+}
+
+/// A shielded recipient must decode as a private receiver on the selected
+/// network. Transparent addresses, other networks and padded text are refused.
+pub fn validate_private_recipient(address: &str, network: Network) -> Result<(), BackendError> {
+    if address.is_empty() || address.len() > 128 || address.trim() != address {
+        return Err(BackendError::Invalid(
+            "enter a private recipient address".into(),
+        ));
+    }
+    match monario_address::Address::decode(address, address_network(network)) {
+        Ok(decoded) => match decoded.receiver() {
+            monario_address::Receiver::Private(_) => Ok(()),
+            monario_address::Receiver::Transparent(_) => Err(BackendError::Invalid(
+                "a shielded send needs a private recipient address".into(),
+            )),
+        },
+        Err(_) => Err(BackendError::Invalid(
+            "invalid private recipient for the selected network".into(),
         )),
     }
 }
@@ -680,7 +718,7 @@ fn current_exe_dir() -> Option<PathBuf> {
 pub fn run(spec: &CommandSpec) -> Result<Outcome, BackendError> {
     spec.validate()?;
     // Passwordless specs (for example pull-remote) receive immediate EOF.
-    let stdin = if spec.frames.is_empty() {
+    let stdin = if spec.frames.is_empty() && spec.payload.is_none() {
         Zeroizing::new(Vec::new())
     } else {
         spec.stdin()?
@@ -1102,6 +1140,51 @@ pub fn read_status(path: &Path) -> Result<NodeStatus, BackendError> {
         return Err(BackendError::OutputTooLarge);
     }
     serde_json::from_slice(&bytes).map_err(|_| BackendError::NotJson("invalid status file".into()))
+}
+
+/// Newest age, in seconds, at which a node snapshot still counts as live. The
+/// GUI polls the status file once per second.
+pub const LIVE_STATUS_MAX_AGE_SECS: u64 = 10;
+
+/// Chain facts from a live managed node. Peers are a current count only while
+/// the snapshot is live.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveChain {
+    pub height: u64,
+    pub tip: String,
+    pub peers: usize,
+}
+
+/// Accept a snapshot as live only when the exact managed pid and profile emitted
+/// it, it is not stopped, its height and tip are canonical, and it is fresh.
+pub fn live_chain(
+    status: &NodeStatus,
+    pid: u32,
+    profile: &str,
+    now_unix: u64,
+) -> Option<LiveChain> {
+    if status.pid != Some(pid) || status.profile != profile || status.stopped {
+        return None;
+    }
+    let age = now_unix.checked_sub(status.updated_unix)?;
+    if age > LIVE_STATUS_MAX_AGE_SECS {
+        return None;
+    }
+    let height = canonical_height(&status.height)?;
+    validate_hex(&status.tip, 32, "validated tip").ok()?;
+    Some(LiveChain {
+        height,
+        tip: status.tip.clone(),
+        peers: status.peers,
+    })
+}
+
+fn canonical_height(value: &str) -> Option<u64> {
+    let digits = !value.is_empty() && value.bytes().all(|c| c.is_ascii_digit());
+    if !digits || (value.len() > 1 && value.starts_with('0')) {
+        return None;
+    }
+    value.parse().ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -1542,9 +1625,25 @@ pub fn wallet_backup(
     current: &Zeroizing<String>,
     backup_password: &Zeroizing<String>,
 ) -> Result<CommandSpec, BackendError> {
+    wallet_backup_to(wallet, backup_name, current, backup_password, None)
+}
+
+/// Back up to an explicit existing directory when `destination` is supplied;
+/// `None` keeps the wallet's default backup location.
+pub fn wallet_backup_to(
+    wallet: &WalletRef,
+    backup_name: &str,
+    current: &Zeroizing<String>,
+    backup_password: &Zeroizing<String>,
+    destination: Option<&str>,
+) -> Result<CommandSpec, BackendError> {
     validate_name(backup_name)?;
     let mut args = wallet_base("backup", wallet)?;
     args.extend(["--backup-name".into(), backup_name.to_owned()]);
+    if let Some(destination) = destination {
+        validate_directory(destination)?;
+        args.extend(["--backup-directory".into(), destination.to_owned()]);
+    }
     Ok(CommandSpec::new(Program::Wallet, args).with_secrets(vec![
         current.clone(),
         backup_password.clone(),
@@ -1569,6 +1668,36 @@ pub fn wallet_recover(
     backup_password: &Zeroizing<String>,
     new_password: &Zeroizing<String>,
 ) -> Result<CommandSpec, BackendError> {
+    wallet_recover_from(
+        directory,
+        backup_name,
+        new_name,
+        network,
+        wallet_id,
+        revision,
+        backup_password,
+        new_password,
+        None,
+    )
+}
+
+/// Recover from an explicit existing backup directory when `source` is supplied;
+/// `None` reads the backup from `directory`, as `wallet_recover` does.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "recovery needs the destination, backup receipt, two distinct passwords and the optional source"
+)]
+pub fn wallet_recover_from(
+    directory: &str,
+    backup_name: &str,
+    new_name: &str,
+    network: Network,
+    wallet_id: &str,
+    revision: u64,
+    backup_password: &Zeroizing<String>,
+    new_password: &Zeroizing<String>,
+    source: Option<&str>,
+) -> Result<CommandSpec, BackendError> {
     validate_directory(directory)?;
     validate_name(backup_name)?;
     validate_name(new_name)?;
@@ -1578,7 +1707,7 @@ pub fn wallet_recover(
         ));
     }
     validate_hex(wallet_id, 16, "backup wallet id")?;
-    let args = vec![
+    let mut args = vec![
         "recover".into(),
         "--directory".into(),
         directory.to_owned(),
@@ -1594,11 +1723,76 @@ pub fn wallet_recover(
         "--backup-name".into(),
         backup_name.to_owned(),
     ];
+    if let Some(source) = source {
+        validate_directory(source)?;
+        args.extend(["--backup-directory".into(), source.to_owned()]);
+    }
     Ok(CommandSpec::new(Program::Wallet, args).with_secrets(vec![
         backup_password.clone(),
         new_password.clone(),
         new_password.clone(),
     ]))
+}
+
+/// One private frame: `u16` little-endian length followed by the exact bytes.
+fn push_frame(out: &mut Zeroizing<Vec<u8>>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+    out.extend_from_slice(bytes);
+}
+
+fn message_payload(message: &str) -> Result<Zeroizing<Vec<u8>>, BackendError> {
+    if !(1..=MAX_MESSAGE).contains(&message.len()) {
+        return Err(BackendError::Invalid(format!(
+            "messages must be 1..={MAX_MESSAGE} bytes"
+        )));
+    }
+    let mut out = Zeroizing::new(Vec::with_capacity(2 + message.len()));
+    push_frame(&mut out, message.as_bytes());
+    Ok(out)
+}
+
+fn verify_payload(message: &str, proof: &str) -> Result<Zeroizing<Vec<u8>>, BackendError> {
+    if proof.is_empty() || !proof.is_ascii() || proof.len() > MAX_PROOF {
+        return Err(BackendError::Invalid(format!(
+            "proofs must be 1..={MAX_PROOF} ASCII bytes"
+        )));
+    }
+    let mut out = message_payload(message)?;
+    push_frame(&mut out, proof.as_bytes());
+    Ok(out)
+}
+
+pub fn wallet_sign_message(
+    wallet: &WalletRef,
+    password: &Zeroizing<String>,
+    account: u32,
+    index: u32,
+    message: &str,
+) -> Result<CommandSpec, BackendError> {
+    let mut args = wallet_base("sign-message", wallet)?;
+    args.extend([
+        "--account".into(),
+        account.to_string(),
+        "--address-index".into(),
+        index.to_string(),
+    ]);
+    Ok(CommandSpec::new(Program::Wallet, args)
+        .with_secrets(one(password))
+        .with_payload(message_payload(message)?))
+}
+
+/// Verification is passwordless: the message and proof travel only in stdin.
+pub fn wallet_verify_message(
+    network: Network,
+    message: &str,
+    proof: &str,
+) -> Result<CommandSpec, BackendError> {
+    let args = vec![
+        "verify-message".into(),
+        "--network".into(),
+        network.as_str().into(),
+    ];
+    Ok(CommandSpec::new(Program::Wallet, args).with_payload(verify_payload(message, proof)?))
 }
 
 // ---------------------------------------------------------------------------
@@ -2033,7 +2227,223 @@ pub fn parse_coins(value: &serde_json::Value) -> Vec<Coin> {
         .unwrap_or_default()
 }
 
+/// Funding pool chosen explicitly in the Send form. A shielded send never falls
+/// back to transparent outputs, and a transparent send never spends notes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FundingPool {
+    #[default]
+    Transparent,
+    Shielded,
+}
+
+impl FundingPool {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Transparent => "Transparent funds",
+            Self::Shielded => "Shielded funds",
+        }
+    }
+}
+
+pub const MAX_PRIVATE_INPUTS: usize = 32;
+
+/// A shielded note from the `private` array of an `inputs` receipt. The
+/// nullifier is only a selection key; the GUI never displays it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrivateNote {
+    pub nullifier: String,
+    pub atoms: u64,
+    pub reserved: bool,
+}
+
+impl PrivateNote {
+    fn parse(value: &serde_json::Value) -> Option<Self> {
+        let nullifier = value.get("nullifier")?.as_str()?;
+        validate_hex(nullifier, 32, "nullifier").ok()?;
+        let atoms = parse_u64(value.get("amount_atoms")?.as_str()?, "amount").ok()?;
+        let reserved = value.get("reserved")?.as_bool()?;
+        Some(Self {
+            nullifier: nullifier.to_owned(),
+            atoms,
+            reserved,
+        })
+    }
+
+    pub fn selectable(&self) -> bool {
+        !self.reserved
+    }
+}
+
+/// Parse the shielded inventory of an `inputs` receipt. Fail closed: one
+/// malformed entry or repeated nullifier rejects the whole inventory, because a
+/// partial view could hide a conflicting claim.
+pub fn parse_private_notes(value: &serde_json::Value) -> Result<Vec<PrivateNote>, BackendError> {
+    let entries = value
+        .get("private")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| BackendError::NotJson("the private note inventory is missing".into()))?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut notes = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let note = PrivateNote::parse(entry)
+            .ok_or_else(|| BackendError::NotJson("a private note entry is malformed".into()))?;
+        if !seen.insert(note.nullifier.clone()) {
+            return Err(BackendError::NotJson(
+                "the private note inventory repeats a nullifier".into(),
+            ));
+        }
+        notes.push(note);
+    }
+    Ok(notes)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShieldedPlan {
+    pub nullifiers: Vec<String>,
+    pub amount_atoms: u64,
+    pub fee_atoms: u64,
+    pub selected_atoms: u64,
+    pub change_atoms: u64,
+}
+
+/// Check an explicit note selection against the scanned inventory. Only the
+/// listed, unreserved notes can be spent; every sum uses checked arithmetic.
+pub fn plan_shielded(
+    notes: &[PrivateNote],
+    selected: &[String],
+    amount_atoms: u64,
+    fee_atoms: u64,
+    max_fee_atoms: u64,
+) -> Result<ShieldedPlan, BackendError> {
+    if selected.is_empty() || selected.len() > MAX_PRIVATE_INPUTS {
+        return Err(BackendError::Invalid(format!(
+            "select between 1 and {MAX_PRIVATE_INPUTS} private notes"
+        )));
+    }
+    validate_atoms(amount_atoms)?;
+    if fee_atoms == 0 || fee_atoms > max_fee_atoms {
+        return Err(BackendError::Invalid(
+            "the fee must be positive and within the max fee".into(),
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut selected_atoms = 0u64;
+    for nullifier in selected {
+        validate_hex(nullifier, 32, "nullifier")?;
+        if !seen.insert(nullifier.as_str()) {
+            return Err(BackendError::Invalid(
+                "a private note is selected twice".into(),
+            ));
+        }
+        let note = notes
+            .iter()
+            .find(|note| note.nullifier == *nullifier)
+            .ok_or_else(|| {
+                BackendError::Invalid(
+                    "a selected private note is no longer in the scanned inventory; scan again"
+                        .into(),
+                )
+            })?;
+        if !note.selectable() {
+            return Err(BackendError::Invalid(
+                "a selected private note is reserved by a signed transaction".into(),
+            ));
+        }
+        selected_atoms = selected_atoms
+            .checked_add(note.atoms)
+            .ok_or_else(|| BackendError::Invalid("the selected notes are too large".into()))?;
+    }
+    let required = amount_atoms
+        .checked_add(fee_atoms)
+        .ok_or_else(|| BackendError::Invalid("amount is too large".into()))?;
+    let change_atoms = selected_atoms.checked_sub(required).ok_or_else(|| {
+        BackendError::Invalid("the selected notes do not cover the amount and fee".into())
+    })?;
+    Ok(ShieldedPlan {
+        nullifiers: selected.to_vec(),
+        amount_atoms,
+        fee_atoms,
+        selected_atoms,
+        change_atoms,
+    })
+}
+
+/// Request document for a shielded send. It uses the same `construct` schema
+/// with `funding.pool = "private"`; change is always private.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShieldedRequest {
+    pub network: Network,
+    pub validated_tip: String,
+    pub nullifiers: Vec<String>,
+    pub input_atoms: u64,
+    pub recipient: String,
+    pub amount_atoms: u64,
+    pub fee_atoms: u64,
+    pub expiry_height: u64,
+}
+
+impl ShieldedRequest {
+    pub fn validate(&self) -> Result<(), BackendError> {
+        validate_hex(&self.validated_tip, 32, "validated tip")?;
+        if self.nullifiers.is_empty() || self.nullifiers.len() > MAX_PRIVATE_INPUTS {
+            return Err(BackendError::Invalid(format!(
+                "select between 1 and {MAX_PRIVATE_INPUTS} private notes"
+            )));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for nullifier in &self.nullifiers {
+            validate_hex(nullifier, 32, "nullifier")?;
+            if !seen.insert(nullifier) {
+                return Err(BackendError::Invalid(
+                    "a private note is selected twice".into(),
+                ));
+            }
+        }
+        validate_private_recipient(&self.recipient, self.network)?;
+        validate_atoms(self.amount_atoms)?;
+        if self.fee_atoms == 0 {
+            return Err(BackendError::Invalid(
+                "the fee must be positive".into(),
+            ));
+        }
+        if self.expiry_height == 0 {
+            return Err(BackendError::Invalid(
+                "the expiry height must be positive".into(),
+            ));
+        }
+        let required = self
+            .amount_atoms
+            .checked_add(self.fee_atoms)
+            .ok_or_else(|| BackendError::Invalid("amount is too large".into()))?;
+        if self.input_atoms < required {
+            return Err(BackendError::Invalid(
+                "the selected notes do not cover the amount and fee".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn to_json(&self) -> Result<String, BackendError> {
+        self.validate()?;
+        let document = serde_json::json!({
+            "version": 1,
+            "validated_tip": self.validated_tip,
+            "funding": {"pool": "private", "inputs": self.nullifiers},
+            "payments": [{"address": self.recipient, "amount_atoms": self.amount_atoms.to_string()}],
+            "fee_atoms": self.fee_atoms.to_string(),
+            "expiry_height": self.expiry_height,
+            "change": "private",
+            "service": null,
+        });
+        serde_json::to_string_pretty(&document)
+            .map_err(|_| BackendError::Invalid("could not encode the request".into()))
+    }
+}
+
 pub const COLLATERAL_ATOMS: u64 = 1000 * ATOMS_PER_MONAR;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tool_tests;

@@ -108,6 +108,9 @@ pub(crate) fn onboard_form(app: &mut GuiApp, ui: &mut egui::Ui) {
             ui.label(theme::caption("Directory (backup and new wallet)"));
             theme::field(ui, &mut app.form_dir, "C:\\Monario\\wallet");
             ui.add_space(4.0);
+            ui.label(theme::caption("Backup source directory (optional)"));
+            theme::field(ui, &mut app.form_recover_source, "Blank uses the directory above");
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
                 let half = (ui.available_width() - 10.0) * 0.5;
                 ui.allocate_ui_with_layout(
@@ -227,6 +230,8 @@ impl GuiApp {
         let node_running = self.node.is_some();
         let busy = self.is_busy();
         let scan_configured = self.state.source.validate().is_ok();
+        let live = self.live_chain_now();
+        let scanned = self.scanned_height();
 
         let mut refresh = false;
         let mut derive = false;
@@ -313,13 +318,17 @@ impl GuiApp {
                 } else {
                     "Setup required"
                 }));
-                if let Some(status) = self.node_status.as_ref().filter(|_| node_running) {
-                    theme::key_value(ui, "Height", &status.height);
-                    theme::key_value(ui, "Peers", &status.peers.to_string());
+                if node_running {
+                    let (height, peers) = GuiApp::chain_readout(true, live.as_ref());
+                    theme::key_value(ui, "Local height", &height);
+                    theme::key_value(ui, "Connected peers", &peers);
                 } else {
                     ui.label(theme::caption(
                         "Manage the node and chain used by this wallet.",
                     ));
+                }
+                if let Some(height) = scanned {
+                    theme::key_value(ui, "Last validated scan height", &height.to_string());
                 }
                 if ui
                     .add(theme::button_secondary("Open node settings"))
@@ -372,14 +381,49 @@ impl GuiApp {
     }
 
     pub(crate) fn send(&mut self, ui: &mut egui::Ui) {
+        self.reconcile_send_scope();
         page_header(
             ui,
             "Send MONAR",
-            "Send from transparent funds to a transparent or private address.",
+            "Choose the funding pool for each payment. A shielded send never falls back to transparent funds, and a transparent send never spends notes.",
         );
 
         let busy = self.is_busy();
+        let mut chosen = self.send_mode;
+        card(ui, |ui| {
+            ui.label(theme::section("Funding pool"));
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                for option in [
+                    backend::FundingPool::Transparent,
+                    backend::FundingPool::Shielded,
+                ] {
+                    if ui
+                        .add_enabled_ui(!busy, |ui| {
+                            ui.selectable_label(chosen == option, option.label())
+                        })
+                        .inner
+                        .clicked()
+                    {
+                        chosen = option;
+                    }
+                }
+            });
+            ui.add_space(4.0);
+            ui.label(theme::caption(match chosen {
+                backend::FundingPool::Transparent => {
+                    "Spends public transparent outputs. The recipient and amount are public. Change follows the Change setting under Advanced settings."
+                }
+                backend::FundingPool::Shielded => {
+                    "Spends only your private notes, so amounts stay hidden. The recipient must be a private address on this network, and change always returns privately."
+                }
+            }));
+        });
+        self.set_send_mode(chosen);
+
+        let mode = self.send_mode;
         let coins = self.coins.clone();
+        let notes = self.private_notes.clone();
         let scan_configured = self.state.source.validate().is_ok();
         let inputs_height = self.inputs_height;
         let construct = self.construct.clone();
@@ -416,6 +460,52 @@ impl GuiApp {
                 }
             });
 
+            if mode == backend::FundingPool::Shielded {
+                card(ui, |ui| {
+                    ui.label(theme::section("Select private notes"));
+                    ui.label(theme::caption(
+                        "Each note is shown by its amount only. Reserved notes belong to a signed transaction and can't be selected.",
+                    ));
+                    ui.add_space(4.0);
+                    if notes.is_empty() {
+                        ui.label(theme::caption(if inputs_height.is_some() {
+                            "No unspent shielded notes found."
+                        } else {
+                            "Notes appear here after scanning."
+                        }));
+                    } else {
+                        egui::ScrollArea::vertical()
+                            .max_height(190.0)
+                            .show(ui, |ui| {
+                                for (index, note) in notes.iter().enumerate() {
+                                    let mut selected = app.send_notes.contains(&note.nullifier);
+                                    ui.horizontal_wrapped(|ui| {
+                                        if ui
+                                            .add_enabled(
+                                                !busy && note.selectable(),
+                                                egui::Checkbox::without_text(&mut selected),
+                                            )
+                                            .changed()
+                                        {
+                                            if selected {
+                                                app.send_notes.insert(note.nullifier.clone());
+                                            } else {
+                                                app.send_notes.remove(&note.nullifier);
+                                            }
+                                        }
+                                        ui.label(theme::caption(&format!("Note {}", index + 1)));
+                                        ui.label(theme::caption(if note.selectable() {
+                                            "spendable"
+                                        } else {
+                                            "reserved"
+                                        }));
+                                        ui.label(theme::mono(&atom_text(note.atoms)));
+                                    });
+                                }
+                            });
+                    }
+                });
+            } else {
             card(ui, |ui| {
                 ui.label(theme::section("Select transparent outputs"));
                 ui.label(theme::caption(
@@ -438,7 +528,7 @@ impl GuiApp {
                                 ui.horizontal_wrapped(|ui| {
                                     if ui
                                         .add_enabled(
-                                            coin.selectable(),
+                                            !busy && coin.selectable(),
                                             egui::Checkbox::without_text(&mut selected),
                                         )
                                         .changed()
@@ -465,13 +555,19 @@ impl GuiApp {
                         });
                 }
             });
+            }
         };
         let mut payment = |app: &mut Self, ui: &mut egui::Ui| {
-            let balance_atoms: u64 = app
-                .selected_coins(&coins, &app.send_coins)
-                .iter()
-                .map(|coin| coin.atoms)
-                .sum();
+            let balance_atoms: u64 = match mode {
+                backend::FundingPool::Transparent => app
+                    .selected_coins(&coins, &app.send_coins)
+                    .iter()
+                    .fold(0u64, |sum, coin| sum.saturating_add(coin.atoms)),
+                backend::FundingPool::Shielded => notes
+                    .iter()
+                    .filter(|note| app.send_notes.contains(&note.nullifier))
+                    .fold(0u64, |sum, note| sum.saturating_add(note.atoms)),
+            };
             card(ui, |ui| {
                 ui.label(theme::section("Payment details"));
                 ui.add_space(4.0);
@@ -481,20 +577,40 @@ impl GuiApp {
                     Network::Test => ("testmont1", "testmonz1"),
                     Network::Regtest => ("rmont1", "rmonz1"),
                 };
-                theme::field(
-                    ui,
-                    &mut app.send_address,
-                    &format!("{transparent}… or {private}…"),
-                );
-                let recipient = app.send_address.trim();
-                if recipient.starts_with(transparent) {
-                    ui.label(theme::caption(
-                        "The recipient address and amount are public.",
-                    ));
-                } else if recipient.starts_with(private) {
-                    ui.label(theme::caption(
-                        "Private address format. The selected transparent inputs remain public.",
-                    ));
+                match mode {
+                    backend::FundingPool::Transparent => {
+                        theme::field(
+                            ui,
+                            &mut app.send_address,
+                            &format!("{transparent}… or {private}…"),
+                        );
+                        let recipient = app.send_address.trim();
+                        if recipient.starts_with(transparent) {
+                            ui.label(theme::caption(
+                                "The recipient address and amount are public.",
+                            ));
+                        } else if recipient.starts_with(private) {
+                            ui.label(theme::caption(
+                                "Private address format. The selected transparent inputs remain public.",
+                            ));
+                        }
+                    }
+                    backend::FundingPool::Shielded => {
+                        theme::field(ui, &mut app.send_address, &format!("{private}…"));
+                        let recipient = app.send_address.trim();
+                        if recipient.is_empty() {
+                            ui.label(theme::caption(
+                                "Enter a private address on this network. Transparent addresses are refused.",
+                            ));
+                        } else {
+                            match backend::validate_private_recipient(recipient, app.form_network) {
+                                Ok(()) => ui.label(theme::caption(
+                                    "Valid private recipient. The amount stays hidden.",
+                                )),
+                                Err(error) => ui.label(theme::caption(&error.to_string())),
+                            };
+                        }
+                    }
                 }
                 ui.add_space(4.0);
                 ui.columns(2, |columns| {
@@ -511,7 +627,14 @@ impl GuiApp {
                         columns[1].label(theme::caption("Expires after (blocks)"));
                         theme::field(&mut columns[1], &mut app.send_expiry, "20");
                         columns[2].label(theme::caption("Change"));
-                        columns[2].checkbox(&mut app.state.send_change_private, "Private change");
+                        if mode == backend::FundingPool::Shielded {
+                            columns[2].label(theme::caption("Private, required"));
+                        } else {
+                            columns[2].checkbox(
+                                &mut app.state.send_change_private,
+                                "Private change",
+                            );
+                        }
                     });
                 });
                 theme::divider(ui);
@@ -521,6 +644,25 @@ impl GuiApp {
                     "Selected value",
                     &format!("{} MONAR", backend::format_monar(balance_atoms)),
                 );
+                let ready = match mode {
+                    backend::FundingPool::Transparent => balance_atoms > 0,
+                    backend::FundingPool::Shielded => match app.shielded_draft() {
+                        Ok(plan) => {
+                            theme::key_value(
+                                ui,
+                                "Private change",
+                                &atom_text(plan.change_atoms),
+                            );
+                            true
+                        }
+                        Err(error) => {
+                            if !app.send_notes.is_empty() || !app.send_amount.trim().is_empty() {
+                                ui.label(theme::caption(&error.to_string()));
+                            }
+                            false
+                        }
+                    },
+                };
                 ui.add_space(8.0);
                 ui.checkbox(
                     &mut app.confirm_reserve,
@@ -533,7 +675,7 @@ impl GuiApp {
                         && scan_configured
                         && inputs_height.is_some()
                         && app.confirm_reserve
-                        && balance_atoms > 0,
+                        && ready,
                     theme::button_primary("Sign transaction"),
                 )
                 .on_disabled_hover_text("Scan for funds, select outputs, and confirm input reservation before signing.")
@@ -635,6 +777,7 @@ impl GuiApp {
             card(ui, |ui| {
                 ui.label(theme::section("SIGNED TRANSACTION"));
                 ui.add_space(4.0);
+                theme::key_value(ui, "Funding", construct.funding.label());
                 theme::key_value(ui, "Reservation", &GuiApp::short(&construct.reservation));
                 theme::key_value(
                     ui,
@@ -993,6 +1136,10 @@ impl GuiApp {
                 }));
             });
             ui.label(theme::caption(self.form_network.label()));
+            let live = self.live_chain_now();
+            let (height, peers) = GuiApp::chain_readout(running, live.as_ref());
+            theme::key_value(ui, "Local height", &height);
+            theme::key_value(ui, "Connected peers", &peers);
             if let Some(status) = &self.node_status {
                 ui.add_space(6.0);
                 theme::divider(ui);
@@ -1085,6 +1232,7 @@ impl GuiApp {
         );
         let busy = self.is_busy();
         let running = self.node.is_some();
+        let live = self.live_chain_now();
         let mut create_identity = false;
         let mut verify_identity = false;
         let mut create_inbox = false;
@@ -1392,9 +1540,10 @@ impl GuiApp {
         if let Some(status) = &self.node_status {
             card(ui, |ui| {
                 ui.label(theme::section("LIVE SNAPSHOT"));
-                theme::key_value(ui, "Height", &status.height);
+                let (height, peers) = GuiApp::chain_readout(true, live.as_ref());
+                theme::key_value(ui, "Local height", &height);
                 theme::key_value(ui, "Tip", &GuiApp::short(&status.tip));
-                theme::key_value(ui, "Peers", &status.peers.to_string());
+                theme::key_value(ui, "Connected peers", &peers);
                 theme::key_value(
                     ui,
                     "Stopped flag",
@@ -1538,6 +1687,9 @@ impl GuiApp {
             ui.label(theme::caption("Backup name"));
             theme::field(ui, &mut self.backup_name, "backup");
             ui.add_space(4.0);
+            ui.label(theme::caption("Backup destination (optional)"));
+            theme::field(ui, &mut self.backup_destination, "Blank keeps the default location");
+            ui.add_space(4.0);
             ui.label(theme::caption("Backup password"));
             if self.reveal {
                 theme::field(ui, &mut self.backup_password, "12 to 1024 bytes");
@@ -1557,6 +1709,19 @@ impl GuiApp {
                 .clicked()
             {
                 self.backup_wallet();
+            }
+            if let Some(receipt) = &self.backup_receipt {
+                ui.add_space(8.0);
+                ui.label(theme::caption(
+                    "Recovery receipt. Keep it with the backup; recovery needs its wallet id and revision.",
+                ));
+                ui.add(egui::Label::new(theme::mono(receipt)).wrap());
+                if ui
+                    .add(theme::button_secondary("Copy recovery receipt"))
+                    .clicked()
+                {
+                    ui.ctx().copy_text(receipt.clone());
+                }
             }
         });
 

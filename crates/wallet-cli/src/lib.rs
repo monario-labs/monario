@@ -17,6 +17,7 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 mod balance;
 mod fee;
+mod message;
 mod payout;
 mod pull_remote;
 mod service;
@@ -26,8 +27,8 @@ mod submission;
 mod transaction_status;
 mod transactions;
 
-pub const HELP: &str = "Monario offline wallet CLI\n\nCommands: create, info, address, service-key, service-status, service-authorize, service-step, service-supervise, balance, discover, pull-remote, fee-estimate, inputs, plan-payment, construct, payout-execute, transaction-export, transaction-status, rebroadcast-step, submit, submission-status, password-change, backup, recover\nAll wallet commands: --directory DIR --name NAME --network main|test|regtest --password-stdin\nExisting wallet/backup: --wallet-id HEX --revision N\nAddress: --type private|transparent [--account N; default 0]\nService-key: [--account N; default 0]; reserves a transparent external index and returns its operator public key.\nService-authorize: same chain/registration flags as service-status, --purpose rotation|reactivation --operator-index N [--account N]; exports public authorization only.\nService-step: balance scan/account flags, --schedule NAME.json --max-fee-atoms N --node-directory DIR --submission-inbox NAME --node-public-key HEX; one bounded proof/submission step, no timer or network.\nService-supervise: the same service-step flags plus --interval-seconds 1..3600 and optional --max-steps N --stop-file NAME.stop --health-file NAME.json; repeats the same bounded step in this process until stopped and writes a bounded public health record for external monitoring. The password is read once from protected stdin and dropped after the store unlocks; only the unlocked store stays in memory. Secrets are never accepted from argv, the environment or a file, and a step error stops supervision rather than retrying.\nService-status: --chain-directory DIR --manifest NAME --profile HEX --registration HEX [--checkpoint TRUSTED_HEX]; no scan-window flags.\nBalance: --chain-directory DIR --manifest NAME --profile HEX --external N --internal N [--account N; default 0] [--max-blocks N; default 100000] [--checkpoint TRUSTED_HEX] [--rescan]\nDiscover: --chain-directory DIR --manifest NAME --profile HEX --account N [--gap N; default 20] [--start N; default 64] [--max N; default 10000] [--max-blocks N; default 100000] [--checkpoint TRUSTED_HEX]; bounded transparent gap-limit discovery. Observed indices are a lower bound and never prove that no unused issued address exists. It issues nothing, opens no socket and exports no key.\nPull-remote: --chain-directory DIR --manifest NAME --profile HEX --remote HOST:PORT --token-file NAME.token --remote-public-key HEX [--max-blocks N; default 1000] [--timeout-seconds N; default 30] [--checkpoint TRUSTED_HEX]; bounded remote page bootstrap into a local validated chain. It opens no wallet, signs nothing and exports no key. Pages are fully validated and durably committed before progress advances; the source can withhold data but cannot forge a block. The key is the node's published scan_public_key and is mandatory: every pull uses the encrypted, key-pinned scan transport with no plaintext fallback. Repeat to continue past --max-blocks, then run balance.\nFee-estimate: --chain-directory DIR --manifest NAME --profile HEX [--blocks N; default 20] [--samples N; default 200] [--tx-bytes N; default 250] [--floor-atoms N; default 0] [--checkpoint TRUSTED_HEX]; historical fee samples from the active validated branch only. Fewer than eight samples returns no suggestion. It is a heuristic, not mempool policy or an inclusion guarantee.\nScan projections are encrypted and incremental; --rescan rebuilds them. Checkpoint pins must come from independently validated state; full replay is the default, with no silent fallback from a bad pin.\nPayout-execute: same scan/account flags as plan-payment, --request NAME.json --max-fee-atoms N --node-directory DIR --submission-inbox NAME --node-public-key HEX; plans one reviewed pool payout batch, signs and publishes the exact bytes, and never broadcasts or holds a key in the node.
-Inputs/plan-payment/construct: same scan/account flags as balance. Plan-payment and construct require --request NAME.json --max-fee-atoms N.\nTransaction-export: --profile HEX --reservation HEX (no scan flags).\nTransaction-status: --chain-directory DIR --manifest NAME --profile HEX --reservation HEX [--checkpoint TRUSTED_HEX]; current validated transaction state, no scan-window or inbox flags. Confirmation is by transaction effects ID; depth counts the inclusion block as one. This is not an exact authorization-payload or finality proof.\nRebroadcast-step: transaction-status chain flags without --reservation, plus --node-directory DIR --submission-inbox NAME --node-public-key HEX [--after-reservation HEX]. Examines at most eight reservations; revalidates and queues only existing valid signed bytes. Resume with next_after_reservation; begin a new pass when null. No timer, signing, replacement or claim release. Protect receipts containing wallet linkage.\nSubmit/status: --node-directory DIR --submission-inbox NAME --node-public-key HEX --profile HEX --reservation HEX.\nSubmit queues exact stored signed bytes; admission observations are historical, never network/chain confirmation. Status includes inbox phase/peer; inactive inboxes are never followed automatically.\nInputs and transactions expose sensitive linkage/bytes: protect stdout. Construction commits input claims and exact signed bytes before output; never blindly retry after failure.\nConfirmed balances in atoms for one explicit account/window, complete to local validated tip; excludes pending transactions.\nBackup/recover: --backup-name NAME (recover --name is the NEW destination)\nPasswords: protected non-terminal stdin, u16 little-endian length then 12..1024 exact bytes; EOF required.\nCreate: new+confirmation. Info/address/service-key/service-status/service-authorize/service-step/balance/inputs/plan-payment/construct/payout-execute/transaction-export/transaction-status/rebroadcast-step/submit/submission-status: current. Password-change: current+new+confirmation. Backup: current+backup+confirmation. Recover: backup+new+confirmation.\nNo passwords in argv/environment. Save public receipts independently. Recovery preserves its issuance lock until trusted scan/history verification; no CLI bypass. No network, genesis, mining or key export.\n";
+pub const HELP: &str = "Monario offline wallet CLI\n\nCommands: create, info, address, sign-message, verify-message, service-key, service-status, service-authorize, service-step, service-supervise, balance, discover, pull-remote, fee-estimate, inputs, plan-payment, construct, payout-execute, transaction-export, transaction-status, rebroadcast-step, submit, submission-status, password-change, backup, recover\nAll wallet commands: --directory DIR --name NAME --network main|test|regtest --password-stdin\nExisting wallet/backup: --wallet-id HEX --revision N\nAddress: --type private|transparent [--account N; default 0]\nService-key: [--account N; default 0]; reserves a transparent external index and returns its operator public key.\nService-authorize: same chain/registration flags as service-status, --purpose rotation|reactivation --operator-index N [--account N]; exports public authorization only.\nService-step: balance scan/account flags, --schedule NAME.json --max-fee-atoms N --node-directory DIR --submission-inbox NAME --node-public-key HEX; one bounded proof/submission step, no timer or network.\nService-supervise: the same service-step flags plus --interval-seconds 1..3600 and optional --max-steps N --stop-file NAME.stop --health-file NAME.json; repeats the same bounded step in this process until stopped and writes a bounded public health record for external monitoring. The password is read once from protected stdin and dropped after the store unlocks; only the unlocked store stays in memory. Secrets are never accepted from argv, the environment or a file, and a step error stops supervision rather than retrying.\nService-status: --chain-directory DIR --manifest NAME --profile HEX --registration HEX [--checkpoint TRUSTED_HEX]; no scan-window flags.\nBalance: --chain-directory DIR --manifest NAME --profile HEX --external N --internal N [--account N; default 0] [--max-blocks N; default 100000] [--checkpoint TRUSTED_HEX] [--rescan]\nDiscover: --chain-directory DIR --manifest NAME --profile HEX --account N [--gap N; default 20] [--start N; default 64] [--max N; default 10000] [--max-blocks N; default 100000] [--checkpoint TRUSTED_HEX]; bounded transparent gap-limit discovery. Observed indices are a lower bound and never prove that no unused issued address exists. It issues nothing, opens no socket and exports no key.\nPull-remote: --chain-directory DIR --manifest NAME --profile HEX --remote HOST:PORT --token-file NAME.token --remote-public-key HEX [--max-blocks N; default 1000] [--timeout-seconds N; default 30] [--checkpoint TRUSTED_HEX]; bounded remote page bootstrap into a local validated chain. It opens no wallet, signs nothing and exports no key. Pages are fully validated and durably committed before progress advances; the source can withhold data but cannot forge a block. The key is the node's published scan_public_key and is mandatory: every pull uses the encrypted, key-pinned scan transport with no plaintext fallback. Repeat to continue past --max-blocks, then run balance.\nFee-estimate: --chain-directory DIR --manifest NAME --profile HEX [--blocks N; default 20] [--samples N; default 200] [--tx-bytes N; default 250] [--floor-atoms N; default 0] [--checkpoint TRUSTED_HEX]; historical fee samples from the active validated branch only. Fewer than eight samples returns no suggestion. It is a heuristic, not mempool policy or an inclusion guarantee.\nScan projections are encrypted and incremental; --rescan rebuilds them. Checkpoint pins must come from independently validated state; full replay is the default, with no silent fallback from a bad pin.\nPayout-execute: same scan/account flags as plan-payment, --request NAME.json --max-fee-atoms N --node-directory DIR --submission-inbox NAME --node-public-key HEX; plans one reviewed pool payout batch, signs and publishes the exact bytes, and never broadcasts or holds a key in the node.
+Inputs/plan-payment/construct: same scan/account flags as balance. Plan-payment and construct require --request NAME.json --max-fee-atoms N.\nTransaction-export: --profile HEX --reservation HEX (no scan flags).\nTransaction-status: --chain-directory DIR --manifest NAME --profile HEX --reservation HEX [--checkpoint TRUSTED_HEX]; current validated transaction state, no scan-window or inbox flags. Confirmation is by transaction effects ID; depth counts the inclusion block as one. This is not an exact authorization-payload or finality proof.\nRebroadcast-step: transaction-status chain flags without --reservation, plus --node-directory DIR --submission-inbox NAME --node-public-key HEX [--after-reservation HEX]. Examines at most eight reservations; revalidates and queues only existing valid signed bytes. Resume with next_after_reservation; begin a new pass when null. No timer, signing, replacement or claim release. Protect receipts containing wallet linkage.\nSubmit/status: --node-directory DIR --submission-inbox NAME --node-public-key HEX --profile HEX --reservation HEX.\nSubmit queues exact stored signed bytes; admission observations are historical, never network/chain confirmation. Status includes inbox phase/peer; inactive inboxes are never followed automatically.\nInputs and transactions expose sensitive linkage/bytes: protect stdout. Construction commits input claims and exact signed bytes before output; never blindly retry after failure.\nConfirmed balances in atoms for one explicit account/window, complete to local validated tip; excludes pending transactions.\nBackup/recover: --backup-name NAME (recover --name is the NEW destination) [--backup-directory DIR: existing private directory; backup destination or recover source, default same as --directory]\nPasswords: protected non-terminal stdin, u16 little-endian length then 12..1024 exact bytes; EOF required. Sign-message: wallet selector flags plus [--account N; default 0] --address-index N; stdin is the password frame, then a u16 little-endian frame of 1..4096 exact UTF-8 message bytes, then EOF; outputs {address,proof} for a previously issued external transparent index only. Verify-message: --network main|test|regtest only; no wallet; stdin is a u16 message frame, then a u16 ASCII proof frame (monmsg1:address:pubkey:sig), then EOF; outputs {valid,address} or one generic failure.\nCreate: new+confirmation. Info/address/service-key/service-status/service-authorize/service-step/balance/inputs/plan-payment/construct/payout-execute/transaction-export/transaction-status/rebroadcast-step/submit/submission-status: current. Password-change: current+new+confirmation. Backup: current+backup+confirmation. Recover: backup+new+confirmation.\nNo passwords in argv/environment. Save public receipts independently. Recovery preserves its issuance lock until trusted scan/history verification; no CLI bypass. No network, genesis, mining or key export.\n";
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Action {
     Help,
@@ -56,6 +57,8 @@ enum Action {
     TransactionStatus,
     Rebroadcast,
     PullRemote,
+    SignMessage,
+    VerifyMessage,
 }
 pub struct Command {
     action: Action,
@@ -64,6 +67,7 @@ pub struct Command {
     network: Network,
     expected: Option<WalletCheckpoint>,
     backup: Option<String>,
+    backup_directory: Option<PathBuf>,
     kind: Option<AddressKind>,
     account: u32,
     scan: Option<balance::Options>,
@@ -80,6 +84,7 @@ pub struct Command {
     status: Option<transaction_status::Options>,
     rebroadcast: Option<submission::rebroadcast::Options>,
     remote: Option<pull_remote::Options>,
+    signing: Option<message::Options>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -98,6 +103,8 @@ pub enum Error {
     Transport,
     Transaction,
     Submission,
+    /// Message signing or verification input, issuance or proof is invalid.
+    Message,
 }
 impl Error {
     pub fn message(self) -> &'static str {
@@ -128,6 +135,7 @@ impl Error {
             Self::Output => {
                 "output failed; operation may already be committed; inspect state before retrying"
             }
+            Self::Message => "message signing or verification failed",
         }
     }
 }
@@ -164,6 +172,8 @@ impl Command {
             Some("submit") => Action::Submit,
             Some("submission-status") => Action::SubmissionStatus,
             Some("pull-remote") => Action::PullRemote,
+            Some("sign-message") => Action::SignMessage,
+            Some("verify-message") => Action::VerifyMessage,
             _ => return Err(Error::Arguments),
         };
         let mut options = BTreeMap::new();
@@ -179,6 +189,7 @@ impl Command {
                     | "--wallet-id"
                     | "--revision"
                     | "--backup-name"
+                    | "--backup-directory"
                     | "--type"
                     | "--account"
                     | "--chain-directory"
@@ -215,6 +226,7 @@ impl Command {
                     | "--max-steps"
                     | "--stop-file"
                     | "--health-file"
+                    | "--address-index"
             ) {
                 return Err(Error::Arguments);
             }
@@ -236,6 +248,7 @@ impl Command {
             network: Network::Regtest,
             expected: None,
             backup: None,
+            backup_directory: None,
             kind: None,
             account: 0,
             scan: None,
@@ -252,6 +265,7 @@ impl Command {
             status: None,
             rebroadcast: None,
             remote: None,
+            signing: None,
         };
         if matches!(action, Action::Help | Action::Version) {
             return if options.is_empty() {
@@ -267,6 +281,13 @@ impl Command {
             }
             return Ok(command);
         }
+        if action == Action::VerifyMessage {
+            command.network = network_flag(options.remove("--network"))?;
+            if !options.is_empty() {
+                return Err(Error::Arguments);
+            }
+            return Ok(command);
+        }
         command.directory = options
             .remove("--directory")
             .ok_or(Error::Arguments)?
@@ -276,12 +297,7 @@ impl Command {
             return Err(Error::Arguments);
         }
         command.name = name(&text(options.remove("--name"))?)?;
-        command.network = match text(options.remove("--network"))?.as_str() {
-            "main" => Network::Main,
-            "test" => Network::Test,
-            "regtest" => Network::Regtest,
-            _ => return Err(Error::Arguments),
-        };
+        command.network = network_flag(options.remove("--network"))?;
         if action != Action::Create {
             command.expected = Some(WalletCheckpoint {
                 wallet_id: id(&text(options.remove("--wallet-id"))?)?,
@@ -309,6 +325,7 @@ impl Command {
                 | Action::Construct
                 | Action::PayoutExecute
                 | Action::Plan
+                | Action::SignMessage
         ) && let Some(value) = options.remove("--account")
         {
             let account = number(&text(Some(value))?)?;
@@ -357,6 +374,9 @@ impl Command {
         if action == Action::Plan {
             command.plan = Some(transactions::plan::Options::parse(&mut options)?);
         }
+        if action == Action::SignMessage {
+            command.signing = Some(message::Options::parse(&mut options)?);
+        }
         if matches!(action, Action::Construct | Action::Export) {
             command.transaction = Some(transactions::Options::parse(action, &mut options)?);
         }
@@ -372,6 +392,11 @@ impl Command {
                 return Err(Error::Arguments);
             }
             command.backup = Some(backup);
+            command.backup_directory = match options.remove("--backup-directory") {
+                Some(value) if !value.is_empty() => Some(value.into()),
+                Some(_) => return Err(Error::Arguments),
+                None => None,
+            };
         }
         if !options.is_empty() {
             return Err(Error::Arguments);
@@ -381,7 +406,7 @@ impl Command {
     pub fn needs_password(&self) -> bool {
         !matches!(
             self.action,
-            Action::Help | Action::Version | Action::PullRemote
+            Action::Help | Action::Version | Action::PullRemote | Action::VerifyMessage
         )
     }
 }
@@ -435,6 +460,14 @@ fn text(value: Option<OsString>) -> Result<String, Error> {
     value
         .and_then(|s| s.into_string().ok())
         .ok_or(Error::Arguments)
+}
+fn network_flag(value: Option<OsString>) -> Result<Network, Error> {
+    match text(value)?.as_str() {
+        "main" => Ok(Network::Main),
+        "test" => Ok(Network::Test),
+        "regtest" => Ok(Network::Regtest),
+        _ => Err(Error::Arguments),
+    }
 }
 fn number(text: &str) -> Result<u64, Error> {
     if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
@@ -611,8 +644,18 @@ pub fn execute(
     if command.action == Action::PullRemote {
         return pull_remote::execute(command.remote.ok_or(Error::Arguments)?, output);
     }
+    if command.action == Action::VerifyMessage {
+        return report(&message::verify(command.network, input)?, output);
+    }
     let dir = directory(&command.directory)?;
+    let backup_dir = command.backup_directory.as_deref().map(directory).transpose()?;
+    let backup_location = backup_dir.as_ref().unwrap_or(&dir);
     let current = secret(input)?;
+    let signed = if command.action == Action::SignMessage {
+        Some(message::read_message(input)?)
+    } else {
+        None
+    };
     let replacement = if matches!(
         command.action,
         Action::Password | Action::Backup | Action::Recover
@@ -646,8 +689,12 @@ pub fn execute(
         &command.name,
         !matches!(command.action, Action::Create | Action::Recover),
     )?;
+    let backup_root = match &command.backup_directory {
+        Some(path) => path.canonicalize().map_err(|_| Error::Configuration)?,
+        None => root.clone(),
+    };
     if let Some(backup) = &command.backup {
-        check_files(&root, backup, command.action == Action::Recover)?;
+        check_files(&backup_root, backup, command.action == Action::Recover)?;
     }
     let mut store = if command.action == Action::Create {
         let seed = Seed::generate().map_err(|_| Error::Entropy)?;
@@ -661,7 +708,7 @@ pub fn execute(
         .map_err(storage)?
     } else if command.action == Action::Recover {
         WalletStore::recover(
-            &dir,
+            backup_location,
             command.backup.as_deref().ok_or(Error::Arguments)?,
             &password(&current)?,
             command.expected.ok_or(Error::Arguments)?,
@@ -680,6 +727,14 @@ pub fn execute(
         .map_err(|_| Error::Credentials)?
     };
     drop(current);
+    if command.action == Action::SignMessage {
+        let index = command.signing.ok_or(Error::Arguments)?.index;
+        let message = signed.as_ref().ok_or(Error::Arguments)?;
+        return report(
+            &message::sign(&store, command.account, index, message)?,
+            output,
+        );
+    }
     if command.action == Action::Password {
         store
             .change_password(&password(
@@ -690,7 +745,7 @@ pub fn execute(
     if command.action == Action::Backup {
         let checkpoint = store
             .backup(
-                &dir,
+                backup_location,
                 command.backup.as_deref().ok_or(Error::Arguments)?,
                 &password(replacement.as_deref().ok_or(Error::Credentials)?)?,
             )
@@ -862,3 +917,5 @@ pub fn execute(
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod backup_directory_tests;

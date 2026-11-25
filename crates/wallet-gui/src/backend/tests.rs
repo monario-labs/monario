@@ -618,6 +618,49 @@ fn managed_node_status_ignores_snapshots_from_another_pid() {
 }
 
 #[test]
+fn live_chain_requires_current_pid_profile_and_fresh_canonical_status() {
+    let tip = "bb".repeat(32);
+    let status = |pid: Option<u32>, profile: &str, height: &str, stopped: bool, updated: u64| {
+        NodeStatus {
+            version: 1,
+            pid,
+            profile: profile.into(),
+            tip: tip.clone(),
+            height: height.into(),
+            peers: 2,
+            stopped,
+            updated_unix: updated,
+            ..NodeStatus::default()
+        }
+    };
+    let fresh = status(Some(4242), "aa", "7", false, 100);
+    assert_eq!(
+        live_chain(&fresh, 4242, "aa", 105),
+        Some(LiveChain {
+            height: 7,
+            tip: tip.clone(),
+            peers: 2,
+        })
+    );
+    assert!(live_chain(&fresh, 4242, "aa", 110).is_some());
+    assert!(live_chain(&fresh, 4242, "aa", 111).is_none());
+    assert!(live_chain(&fresh, 1111, "aa", 105).is_none());
+    assert!(live_chain(&status(None, "aa", "7", false, 100), 4242, "aa", 105).is_none());
+    assert!(live_chain(&fresh, 4242, "bb", 105).is_none());
+    assert!(live_chain(&status(Some(4242), "aa", "7", true, 100), 4242, "aa", 105).is_none());
+    assert!(live_chain(&status(Some(4242), "aa", "7", false, 200), 4242, "aa", 105).is_none());
+    for bad in ["", "07", "+7", "-1", "7x", "18446744073709551616"] {
+        assert!(live_chain(&status(Some(4242), "aa", bad, false, 100), 4242, "aa", 105).is_none());
+    }
+    assert!(live_chain(&status(Some(4242), "aa", "0", false, 100), 4242, "aa", 105).is_some());
+    let mut upper = fresh.clone();
+    upper.tip = "BB".repeat(32);
+    assert!(live_chain(&upper, 4242, "aa", 105).is_none());
+    upper.tip = "bb".into();
+    assert!(live_chain(&upper, 4242, "aa", 105).is_none());
+}
+
+#[test]
 fn solo_payout_address_needs_matching_network_and_transparent_receiver() {
     assert!(validate_solo_address(SOLO_REGTEST, Network::Regtest).is_ok());
     assert!(validate_solo_address(SOLO_TEST, Network::Test).is_ok());
@@ -780,4 +823,214 @@ fn fee_estimate_arguments_are_bounded() {
         wallet_fee_estimate(&wallet(), &source(), 0, 200, 250, 0, &pw("aaaaaaaaaaaa")).is_err()
     );
     assert!(wallet_fee_estimate(&wallet(), &source(), 20, 200, 0, 0, &pw("aaaaaaaaaaaa")).is_err());
+}
+
+const PRIVATE_MAIN: &str =
+    "monz1qypgluecd9cuke9cuaufjzxa367hm6f2drjcdg6dhrl2nx006gqkltnkw5904elwjstyd09e6zseag";
+const PRIVATE_TEST: &str =
+    "testmonz1qypgluecd9cuke9cuaufjzxa367hm6f2drjcdg6dhrl2nx006gqkltnkw5904elwjstyd09e9eqypq";
+
+fn nullifier(byte: u8) -> String {
+    format!("{byte:02x}").repeat(32)
+}
+
+fn note(byte: u8, atoms: u64, reserved: bool) -> PrivateNote {
+    PrivateNote {
+        nullifier: nullifier(byte),
+        atoms,
+        reserved,
+    }
+}
+
+fn shielded_good() -> ShieldedRequest {
+    ShieldedRequest {
+        network: Network::Test,
+        validated_tip: "44".repeat(32),
+        nullifiers: vec![nullifier(1)],
+        input_atoms: 100,
+        recipient: PRIVATE_TEST.into(),
+        amount_atoms: 60,
+        fee_atoms: 10,
+        expiry_height: 500,
+    }
+}
+
+#[test]
+fn shielded_request_json_matches_the_cli_schema_exactly() {
+    let request = ShieldedRequest {
+        network: Network::Regtest,
+        validated_tip: "44".repeat(32),
+        nullifiers: vec![nullifier(1), nullifier(2)],
+        input_atoms: 300,
+        recipient: SOLO_REGTEST_PRIVATE.into(),
+        amount_atoms: 120,
+        fee_atoms: 10,
+        expiry_height: 500,
+    };
+    let value: serde_json::Value = serde_json::from_str(&request.to_json().unwrap()).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "version": 1,
+            "validated_tip": "44".repeat(32),
+            "funding": {"pool": "private", "inputs": [nullifier(1), nullifier(2)]},
+            "payments": [{"address": SOLO_REGTEST_PRIVATE, "amount_atoms": "120"}],
+            "fee_atoms": "10",
+            "expiry_height": 500,
+            "change": "private",
+            "service": null
+        })
+    );
+    assert_eq!(FundingPool::default(), FundingPool::Transparent);
+}
+
+#[test]
+fn shielded_request_rejects_malformed_duplicate_and_mismatched_inputs() {
+    let good = shielded_good();
+    assert!(good.to_json().is_ok());
+
+    let mut duplicate = good.clone();
+    duplicate.nullifiers.push(nullifier(1));
+    assert!(duplicate.to_json().is_err());
+
+    let mut malformed = good.clone();
+    malformed.nullifiers = vec!["AB".repeat(32)];
+    assert!(malformed.to_json().is_err());
+
+    let mut empty = good.clone();
+    empty.nullifiers.clear();
+    assert!(empty.to_json().is_err());
+
+    let mut many = good.clone();
+    many.nullifiers = (0..33u8).map(nullifier).collect();
+    assert!(many.to_json().is_err());
+
+    let mut transparent = good.clone();
+    transparent.recipient = SOLO_TEST.into();
+    assert!(transparent.to_json().is_err());
+
+    let mut wrong_network = good.clone();
+    wrong_network.network = Network::Regtest;
+    assert!(wrong_network.to_json().is_err());
+
+    let mut zero = good.clone();
+    zero.amount_atoms = 0;
+    assert!(zero.to_json().is_err());
+
+    let mut no_fee = good.clone();
+    no_fee.fee_atoms = 0;
+    assert!(no_fee.to_json().is_err());
+
+    let mut no_expiry = good.clone();
+    no_expiry.expiry_height = 0;
+    assert!(no_expiry.to_json().is_err());
+
+    let mut short = good.clone();
+    short.input_atoms = 69;
+    assert!(short.to_json().is_err());
+
+    let mut bad_tip = good.clone();
+    bad_tip.validated_tip = "44".into();
+    assert!(bad_tip.to_json().is_err());
+
+    let mut overflow = good;
+    overflow.amount_atoms = u64::MAX;
+    overflow.fee_atoms = 1;
+    overflow.input_atoms = u64::MAX;
+    assert!(overflow.to_json().is_err());
+}
+
+#[test]
+fn shielded_recipient_must_be_private_on_the_same_network() {
+    assert!(validate_private_recipient(SOLO_REGTEST_PRIVATE, Network::Regtest).is_ok());
+    assert!(validate_private_recipient(PRIVATE_TEST, Network::Test).is_ok());
+    assert!(validate_private_recipient(PRIVATE_MAIN, Network::Main).is_ok());
+
+    assert!(validate_private_recipient(SOLO_REGTEST_PRIVATE, Network::Test).is_err());
+    assert!(validate_private_recipient(PRIVATE_TEST, Network::Main).is_err());
+    assert!(validate_private_recipient(PRIVATE_MAIN, Network::Regtest).is_err());
+
+    assert!(validate_private_recipient(SOLO_REGTEST, Network::Regtest).is_err());
+    assert!(validate_private_recipient(SOLO_TEST, Network::Test).is_err());
+
+    let truncated = &SOLO_REGTEST_PRIVATE[..SOLO_REGTEST_PRIVATE.len() - 1];
+    let padded = format!(" {SOLO_REGTEST_PRIVATE}");
+    for bad in ["", "rmonz1fixture", truncated, padded.as_str()] {
+        assert!(
+            validate_private_recipient(bad, Network::Regtest).is_err(),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn private_inventory_is_parsed_fail_closed() {
+    let value = serde_json::json!({
+        "private": [
+            {"nullifier": nullifier(1), "amount_atoms": "700", "reserved": false},
+            {"nullifier": nullifier(2), "amount_atoms": "5", "reserved": true},
+        ]
+    });
+    let notes = parse_private_notes(&value).unwrap();
+    assert_eq!(notes, vec![note(1, 700, false), note(2, 5, true)]);
+    assert!(notes[0].selectable());
+    assert!(!notes[1].selectable());
+
+    let malformed = [
+        serde_json::json!({"nullifier": nullifier(0xab).to_uppercase(), "amount_atoms": "1", "reserved": false}),
+        serde_json::json!({"nullifier": "ab".repeat(31), "amount_atoms": "1", "reserved": false}),
+        serde_json::json!({"nullifier": nullifier(4), "amount_atoms": 1, "reserved": false}),
+        serde_json::json!({"nullifier": nullifier(4), "amount_atoms": "+1", "reserved": false}),
+        serde_json::json!({"nullifier": nullifier(4), "amount_atoms": "18446744073709551616", "reserved": false}),
+        serde_json::json!({"nullifier": nullifier(4), "amount_atoms": "1", "reserved": "no"}),
+        serde_json::json!({"nullifier": nullifier(4), "reserved": false}),
+    ];
+    for bad in malformed {
+        let value = serde_json::json!({"private": [bad]});
+        assert!(parse_private_notes(&value).is_err(), "{value}");
+    }
+
+    let duplicate = serde_json::json!({"private": [
+        {"nullifier": nullifier(1), "amount_atoms": "1", "reserved": false},
+        {"nullifier": nullifier(1), "amount_atoms": "2", "reserved": true},
+    ]});
+    assert!(parse_private_notes(&duplicate).is_err());
+    assert!(parse_private_notes(&serde_json::json!({"transparent": []})).is_err());
+    assert!(
+        parse_private_notes(&serde_json::json!({"private": []}))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn shielded_plan_spends_only_selected_unreserved_notes_with_checked_sums() {
+    let notes = vec![note(1, 700, false), note(2, 300, false), note(3, 50, true)];
+    let plan = plan_shielded(&notes, &[nullifier(1)], 600, 10, 20).unwrap();
+    assert_eq!(plan.nullifiers, vec![nullifier(1)]);
+    assert_eq!(
+        (
+            plan.selected_atoms,
+            plan.amount_atoms,
+            plan.fee_atoms,
+            plan.change_atoms
+        ),
+        (700, 600, 10, 90)
+    );
+
+    assert!(plan_shielded(&notes, &[nullifier(3)], 1, 1, 1).is_err());
+    assert!(plan_shielded(&notes, &[nullifier(9)], 1, 1, 1).is_err());
+    assert!(plan_shielded(&notes, &[nullifier(1), nullifier(1)], 1, 1, 1).is_err());
+    assert!(plan_shielded(&notes, &[], 1, 1, 1).is_err());
+    let many: Vec<String> = (0..33u8).map(nullifier).collect();
+    assert!(plan_shielded(&notes, &many, 1, 1, 1).is_err());
+
+    assert!(plan_shielded(&notes, &[nullifier(1)], 700, 1, 1).is_err());
+    assert!(plan_shielded(&notes, &[nullifier(1)], 0, 1, 1).is_err());
+    assert!(plan_shielded(&notes, &[nullifier(1)], 1, 0, 1).is_err());
+    assert!(plan_shielded(&notes, &[nullifier(1)], 1, 2, 1).is_err());
+
+    let huge = vec![note(1, u64::MAX, false), note(2, 1, false)];
+    assert!(plan_shielded(&huge, &[nullifier(1), nullifier(2)], 1, 1, 1).is_err());
+    assert!(plan_shielded(&notes, &[nullifier(1)], u64::MAX, u64::MAX, u64::MAX).is_err());
 }

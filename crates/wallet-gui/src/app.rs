@@ -8,6 +8,7 @@ use crate::backend::{
 };
 use crate::state::{self, Appearance, PersistedState};
 use crate::theme;
+use crate::wallet_tools::{self, BalanceSnapshot, ConsoleSnapshot, ToolAction, ToolsState};
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Margin, RichText, Stroke, Vec2};
 use std::{
     collections::{BTreeSet, VecDeque},
@@ -28,16 +29,18 @@ pub enum Page {
     Mining,
     Node,
     Settings,
+    Tools,
 }
 
 impl Page {
-    pub const ALL: [(Self, &'static str); 6] = [
+    pub const ALL: [(Self, &'static str); 7] = [
         (Self::Overview, "Overview"),
         (Self::Send, "Send"),
         (Self::Receive, "Receive"),
         (Self::Mining, "Mining"),
         (Self::Node, "Node"),
         (Self::Settings, "Settings"),
+        (Self::Tools, "Tools"),
     ];
 }
 
@@ -93,6 +96,10 @@ fn page_icon(painter: &egui::Painter, page: Page, center: egui::Pos2, color: Col
                 line(pos(-7.0, y), pos(7.0, y));
                 line(pos(handle, y - 2.0), pos(handle, y + 2.0));
             }
+        }
+        Page::Tools => {
+            painter.circle_stroke(center, 7.0, stroke);
+            path(&[(-3.5, 0.0), (-1.0, 2.8), (3.8, -2.8)]);
         }
     }
 }
@@ -166,6 +173,7 @@ pub struct ConstructView {
     pub fee_atoms: u64,
     pub change_atoms: u64,
     pub expiry_height: u64,
+    pub funding: backend::FundingPool,
 }
 
 impl ConstructView {
@@ -179,6 +187,7 @@ impl ConstructView {
             fee_atoms: backend::field_u64(value, "fee_atoms").unwrap_or(0),
             change_atoms: backend::field_u64(value, "change_atoms").unwrap_or(0),
             expiry_height: backend::field_u64(value, "expiry_height").unwrap_or(0),
+            funding: backend::FundingPool::Transparent,
         })
     }
 }
@@ -224,10 +233,10 @@ enum JobTag {
     Recover(WalletRef),
     Address,
     Balance,
-    Inputs,
+    Inputs(SendScope),
     Discover,
     FeeEstimate,
-    Construct,
+    Construct(backend::FundingPool),
     Export,
     TransactionStatus,
     Submit,
@@ -237,9 +246,17 @@ enum JobTag {
     PasswordChange,
     Backup,
     PullRemote,
+    ToolSign { generation: u64 },
+    ToolVerify { generation: u64 },
 }
 
 type JobResult = (JobTag, Result<serde_json::Value, BackendError>);
+
+impl JobTag {
+    fn is_tool(&self) -> bool {
+        matches!(self, Self::ToolSign { .. } | Self::ToolVerify { .. })
+    }
+}
 
 struct Jobs {
     sender: mpsc::Sender<JobResult>,
@@ -259,6 +276,15 @@ impl Jobs {
             let _ = sender.send((tag, result));
         });
     }
+}
+
+/// Everything an inventory depends on. A scan taken under one scope must never
+/// drive selections under another.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SendScope {
+    wallet_id: String,
+    network: Network,
+    source: ChainSource,
 }
 
 pub struct GuiApp {
@@ -290,6 +316,7 @@ pub struct GuiApp {
     pub(crate) form_revision: String,
     pub(crate) form_backup_name: String,
     pub(crate) form_new_name: String,
+    pub(crate) form_recover_source: String,
 
     // Wallet data
     pub(crate) balance: Option<BalanceView>,
@@ -304,6 +331,10 @@ pub struct GuiApp {
     pub(crate) send_fee: String,
     pub(crate) send_max_fee: String,
     pub(crate) send_expiry: String,
+    pub(crate) send_mode: backend::FundingPool,
+    pub(crate) private_notes: Vec<backend::PrivateNote>,
+    pub(crate) send_notes: BTreeSet<String>,
+    pub(crate) inputs_scope: Option<SendScope>,
     pub(crate) confirm_reserve: bool,
     pub(crate) construct: Option<ConstructView>,
     pub(crate) exported_hex: String,
@@ -313,7 +344,10 @@ pub struct GuiApp {
     // Node runtime
     pub(crate) node: Option<ManagedNode>,
     pub(crate) node_kind: Option<NodeKind>,
+    /// Latest snapshot read from the current managed child. Display rechecks
+    /// its pid, profile and freshness before showing live chain values.
     pub(crate) node_status: Option<NodeStatus>,
+    pub(crate) live_profile: String,
     pub(crate) last_poll: Instant,
     pub(crate) stop_rx: Option<Receiver<StopOutcome>>,
     pub(crate) node_started: Instant,
@@ -330,6 +364,8 @@ pub struct GuiApp {
 
     // Settings
     pub(crate) backup_name: String,
+    pub(crate) backup_destination: String,
+    pub(crate) backup_receipt: Option<String>,
     pub(crate) discovery_account: String,
     pub(crate) discovery_gap: String,
     pub(crate) discovery_start: String,
@@ -342,6 +378,11 @@ pub struct GuiApp {
     pub(crate) fee_result: Option<serde_json::Value>,
     pub(crate) show_limitations: bool,
     pub(crate) request_seq: u64,
+
+    // Wallet tools. Results carry the generation they were started under, so
+    // anything that finishes after a lock is discarded.
+    pub(crate) tools: ToolsState,
+    pub(crate) tools_generation: u64,
 }
 
 impl GuiApp {
@@ -377,6 +418,7 @@ impl GuiApp {
             form_revision: "0".into(),
             form_backup_name: "snapshot".into(),
             form_new_name: "restored".into(),
+            form_recover_source: String::new(),
             balance: None,
             coins: Vec::new(),
             inputs_tip: String::new(),
@@ -389,6 +431,10 @@ impl GuiApp {
             send_fee: "0.001".into(),
             send_max_fee: "0.01".into(),
             send_expiry: "20".into(),
+            send_mode: backend::FundingPool::Transparent,
+            private_notes: Vec::new(),
+            send_notes: BTreeSet::new(),
+            inputs_scope: None,
             confirm_reserve: false,
             construct: None,
             exported_hex: String::new(),
@@ -397,6 +443,7 @@ impl GuiApp {
             node: None,
             node_kind: None,
             node_status: None,
+            live_profile: String::new(),
             last_poll: Instant::now(),
             stop_rx: None,
             node_started: Instant::now(),
@@ -409,6 +456,8 @@ impl GuiApp {
             node_checkpoint: String::new(),
             peers_text: String::new(),
             backup_name: String::new(),
+            backup_destination: String::new(),
+            backup_receipt: None,
             discovery_account: "0".into(),
             discovery_gap: "20".into(),
             discovery_start: "64".into(),
@@ -421,6 +470,8 @@ impl GuiApp {
             fee_result: None,
             show_limitations: false,
             request_seq: 1,
+            tools: ToolsState::default(),
+            tools_generation: 0,
             state,
         };
         if let Some(wallet) = app.state.wallet.clone() {
@@ -571,7 +622,68 @@ impl GuiApp {
         self.confirm.clear();
         self.unlocked = false;
         self.construct = None;
+        self.clear_send_inventory();
+        self.tools_generation = self.tools_generation.wrapping_add(1);
+        self.tools.clear_sensitive();
+        self.backup_receipt = None;
         self.info("Wallet locked. Secrets were cleared from memory.");
+    }
+
+    fn send_scope(&self) -> Option<SendScope> {
+        let wallet = self.state.wallet.as_ref()?;
+        Some(SendScope {
+            wallet_id: wallet.wallet_id.clone(),
+            network: wallet.network,
+            source: self.state.source.clone(),
+        })
+    }
+
+    /// Drop every scanned output and selection. Signed reservations live in the
+    /// wallet store and are unaffected; the next scan reports them again.
+    pub(crate) fn clear_send_inventory(&mut self) {
+        self.coins.clear();
+        self.private_notes.clear();
+        self.send_coins.clear();
+        self.send_notes.clear();
+        self.inputs_tip.clear();
+        self.inputs_height = None;
+        self.inputs_scope = None;
+        self.confirm_reserve = false;
+    }
+
+    /// Clear a loaded inventory when the wallet, network, chain source or
+    /// account it was scanned under no longer matches the form.
+    pub(crate) fn reconcile_send_scope(&mut self) {
+        if self.inputs_scope.is_some() && self.inputs_scope != self.send_scope() {
+            self.clear_send_inventory();
+            self.info("Chain or account settings changed. Scan for spendable outputs again.");
+        }
+    }
+
+    pub(crate) fn set_send_mode(&mut self, mode: backend::FundingPool) {
+        if self.send_mode != mode {
+            self.send_mode = mode;
+            self.send_coins.clear();
+            self.send_notes.clear();
+            self.confirm_reserve = false;
+        }
+    }
+
+    /// Validate the shielded draft exactly as construction will. The button and
+    /// the signer share this path, so they cannot disagree.
+    pub(crate) fn shielded_draft(&self) -> Result<backend::ShieldedPlan, BackendError> {
+        let network = self
+            .state
+            .wallet
+            .as_ref()
+            .map(|wallet| wallet.network)
+            .ok_or_else(|| BackendError::Invalid("open a wallet first".into()))?;
+        backend::validate_private_recipient(self.send_address.trim(), network)?;
+        let amount = backend::parse_monar(&self.send_amount)?;
+        let fee = backend::parse_monar(&self.send_fee)?;
+        let max_fee = backend::parse_monar(&self.send_max_fee)?;
+        let selected: Vec<String> = self.send_notes.iter().cloned().collect();
+        backend::plan_shielded(&self.private_notes, &selected, amount, fee, max_fee)
     }
 
     pub(crate) fn create_wallet(&mut self) {
@@ -655,7 +767,9 @@ impl GuiApp {
             self.error("the new password confirmation does not match");
             return;
         }
-        let spec = backend::wallet_recover(
+        let source = self.form_recover_source.trim();
+        let source = (!source.is_empty()).then_some(source);
+        let spec = backend::wallet_recover_from(
             &directory,
             &backup,
             &new_name,
@@ -664,6 +778,7 @@ impl GuiApp {
             revision,
             &self.password,
             &self.new_password,
+            source,
         );
         self.last_action = "Recovering an encrypted backup".into();
         self.spawn(
@@ -712,12 +827,14 @@ impl GuiApp {
                 return;
             }
         };
+        let Some(scope) = self.send_scope() else {
+            self.error("open a wallet first");
+            return;
+        };
         let inputs = backend::wallet_inputs(&wallet, &source, &secret);
-        self.inputs_tip.clear();
-        self.inputs_height = None;
-        self.coins.clear();
+        self.clear_send_inventory();
         self.last_action = "Scanning wallet outputs".into();
-        self.spawn(JobTag::Inputs, inputs);
+        self.spawn(JobTag::Inputs(scope), inputs);
     }
 
     pub(crate) fn new_address(&mut self, kind: backend::AddressKind) {
@@ -739,7 +856,75 @@ impl GuiApp {
         format!("gui-{prefix}-{}-{seq}.json", std::process::id())
     }
 
+    fn transparent_request(&self, amount: u64, fee: u64, expiry: u64) -> Result<String, String> {
+        if self.inputs_tip.is_empty() || self.coins.is_empty() {
+            return Err("scan for spendable outputs before building a transaction".into());
+        }
+        let selected = self.selected_coins(&self.coins, &self.send_coins);
+        let available = selected
+            .iter()
+            .try_fold(0u64, |sum, coin| sum.checked_add(coin.atoms));
+        let required = amount.checked_add(fee);
+        match (available, required) {
+            (Some(available), Some(required)) if available >= required => {}
+            _ => return Err("the selected coins do not cover the amount and fee".into()),
+        }
+        let funding = selected
+            .iter()
+            .map(|coin| backend::OutPoint {
+                transaction: coin.transaction.clone(),
+                index: coin.index,
+            })
+            .collect();
+        let request = PaymentRequest {
+            validated_tip: self.inputs_tip.clone(),
+            funding,
+            payments: vec![Payment {
+                address: self.send_address.trim().to_owned(),
+                atoms: amount,
+            }],
+            fee_atoms: fee,
+            expiry_height: expiry,
+            change: if self.state.send_change_private {
+                backend::AddressKind::Private
+            } else {
+                backend::AddressKind::Transparent
+            },
+            service: None,
+        };
+        request.to_json().map_err(|error| error.to_string())
+    }
+
+    fn shielded_request(&self, expiry: u64) -> Result<String, String> {
+        if self.inputs_tip.is_empty() || self.private_notes.is_empty() {
+            return Err("scan for spendable outputs before building a transaction".into());
+        }
+        let network = self
+            .state
+            .wallet
+            .as_ref()
+            .map(|wallet| wallet.network)
+            .ok_or_else(|| "open a wallet first".to_string())?;
+        let plan = self.shielded_draft().map_err(|error| error.to_string())?;
+        let request = backend::ShieldedRequest {
+            network,
+            validated_tip: self.inputs_tip.clone(),
+            nullifiers: plan.nullifiers,
+            input_atoms: plan.selected_atoms,
+            recipient: self.send_address.trim().to_owned(),
+            amount_atoms: plan.amount_atoms,
+            fee_atoms: plan.fee_atoms,
+            expiry_height: expiry,
+        };
+        request.to_json().map_err(|error| error.to_string())
+    }
+
     pub(crate) fn construct_payment(&mut self) {
+        if self.is_busy() {
+            self.info("Wait for the running wallet operation to finish.");
+            return;
+        }
+        self.reconcile_send_scope();
         let (wallet, source, secret) = match (self.wallet(), self.source(), self.secret()) {
             (Ok(wallet), Ok(source), Ok(secret)) => (wallet, source, secret),
             (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
@@ -755,11 +940,6 @@ impl GuiApp {
             self.error("scan for spendable outputs before building a transaction");
             return;
         };
-        if self.inputs_tip.is_empty() || self.coins.is_empty() {
-            self.error("scan for spendable outputs before building a transaction");
-            return;
-        }
-        let address = self.send_address.trim().to_owned();
         let amount = match backend::parse_monar(&self.send_amount) {
             Ok(amount) => amount,
             Err(error) => {
@@ -788,48 +968,30 @@ impl GuiApp {
                 return;
             }
         };
-        let funding: Vec<backend::OutPoint> = self
-            .selected_coins(&self.coins, &self.send_coins)
-            .into_iter()
-            .map(|coin| backend::OutPoint {
-                transaction: coin.transaction.clone(),
-                index: coin.index,
-            })
-            .collect();
-        let available: u64 = self
-            .selected_coins(&self.coins, &self.send_coins)
-            .iter()
-            .map(|coin| coin.atoms)
-            .sum();
-        if available < amount.saturating_add(fee) {
-            self.error("the selected coins do not cover the amount and fee");
+        let Some(expiry) = height.checked_add(delta) else {
+            self.error("the expiry height is too large");
             return;
-        }
-        let expiry = height.saturating_add(delta);
-        let request = PaymentRequest {
-            validated_tip: self.inputs_tip.clone(),
-            funding,
-            payments: vec![Payment {
-                address,
-                atoms: amount,
-            }],
-            fee_atoms: fee,
-            expiry_height: expiry,
-            change: if self.state.send_change_private {
-                backend::AddressKind::Private
-            } else {
-                backend::AddressKind::Transparent
-            },
-            service: None,
         };
-        let encoded = match request.to_json() {
+        let mode = self.send_mode;
+        let encoded = match mode {
+            backend::FundingPool::Transparent => self.transparent_request(amount, fee, expiry),
+            backend::FundingPool::Shielded => self.shielded_request(expiry),
+        };
+        let encoded = match encoded {
             Ok(encoded) => encoded,
+            Err(error) => {
+                self.error(error);
+                return;
+            }
+        };
+        let name = self.next_request_name("send");
+        let spec = match backend::wallet_construct(&wallet, &source, &name, max_fee, &secret) {
+            Ok(spec) => spec,
             Err(error) => {
                 self.error(error.to_string());
                 return;
             }
         };
-        let name = self.next_request_name("send");
         let path = match state::write_request_file(
             std::path::Path::new(&wallet.directory),
             &name,
@@ -841,10 +1003,9 @@ impl GuiApp {
                 return;
             }
         };
-        let spec = backend::wallet_construct(&wallet, &source, &name, max_fee, &secret);
         self.pending_request = Some(path);
         self.last_action = "Building and signing the transaction".into();
-        self.spawn(JobTag::Construct, spec);
+        self.spawn(JobTag::Construct(mode), Ok(spec));
     }
 
     pub(crate) fn submit_payment(&mut self) {
@@ -1228,6 +1389,7 @@ impl GuiApp {
                 self.node = Some(process);
                 self.node_kind = Some(kind);
                 self.node_status = None;
+                self.live_profile = node.profile.clone();
                 self.node_started = Instant::now();
                 self.last_poll = Instant::now();
                 self.success(match kind {
@@ -1254,6 +1416,7 @@ impl GuiApp {
             return;
         };
         self.node_kind = None;
+        self.node_status = None;
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
             let outcome = node.stop(Duration::from_secs(8));
@@ -1304,14 +1467,135 @@ impl GuiApp {
             self.error("the backup password confirmation does not match");
             return;
         }
-        let spec = backend::wallet_backup(
+        let destination = self.backup_destination.trim();
+        let destination = (!destination.is_empty()).then_some(destination);
+        let spec = backend::wallet_backup_to(
             &wallet,
             self.backup_name.trim(),
             &current,
             &self.backup_password,
+            destination,
         );
+        self.backup_receipt = None;
         self.last_action = "Writing an encrypted backup".into();
         self.spawn(JobTag::Backup, spec);
+    }
+
+    // -----------------------------------------------------------------------
+    // Wallet tools
+    // -----------------------------------------------------------------------
+
+    fn dispatch_tool(&mut self, action: ToolAction) {
+        if self.is_busy() {
+            self.info("Wait for the running wallet operation to finish.");
+            return;
+        }
+        match action {
+            ToolAction::Sign { index, message } => self.sign_message(index, message),
+            ToolAction::Verify { message, proof } => self.verify_message(message, proof),
+            ToolAction::RefreshBalance => {
+                if self.unlocked {
+                    self.refresh_balance();
+                } else {
+                    self.info("Unlock the wallet to refresh the balance.");
+                }
+            }
+        }
+    }
+
+    fn sign_message(&mut self, index: u32, message: String) {
+        let message = Zeroizing::new(message);
+        let (wallet, secret) = match (self.wallet(), self.secret()) {
+            (Ok(wallet), Ok(secret)) if self.unlocked => (wallet, secret),
+            _ => {
+                self.tools.set_failure("Unlock the wallet to sign.");
+                return;
+            }
+        };
+        let spec = match backend::wallet_sign_message(
+            &wallet,
+            &secret,
+            self.state.source.account,
+            index,
+            &message,
+        ) {
+            Ok(spec) => spec,
+            Err(_) => {
+                self.tools.set_failure("The message could not be signed. Check its length.");
+                return;
+            }
+        };
+        self.last_action = "Signing with the offline wallet".into();
+        self.spawn(
+            JobTag::ToolSign {
+                generation: self.tools_generation,
+            },
+            Ok(spec),
+        );
+    }
+
+    fn verify_message(&mut self, message: String, proof: String) {
+        let message = Zeroizing::new(message);
+        let proof = Zeroizing::new(proof);
+        let spec = match backend::wallet_verify_message(self.form_network, &message, &proof) {
+            Ok(spec) => spec,
+            Err(_) => {
+                self.tools.set_failure(
+                    "Check the message and proof. The proof must be ASCII and at most 512 bytes.",
+                );
+                return;
+            }
+        };
+        self.last_action = "Checking the signature offline".into();
+        self.spawn(
+            JobTag::ToolVerify {
+                generation: self.tools_generation,
+            },
+            Ok(spec),
+        );
+    }
+
+    fn finish_tool(&mut self, tag: JobTag, result: Result<serde_json::Value, BackendError>) {
+        let (generation, signing) = match tag {
+            JobTag::ToolSign { generation } => (generation, true),
+            JobTag::ToolVerify { generation } => (generation, false),
+            _ => return,
+        };
+        if generation != self.tools_generation {
+            return;
+        }
+        // Fixed text only: child diagnostics may echo request data.
+        let Ok(value) = result else {
+            self.tools.set_failure(if signing {
+                "Signing failed. Check that the wallet is unlocked and try again."
+            } else {
+                "Verification failed. Check the message and proof."
+            });
+            return;
+        };
+        if signing {
+            match wallet_tools::signed_receipt(&value) {
+                Some((proof, signer)) => self.tools.set_signed(proof, signer),
+                None => self.tools.set_failure("The signing receipt was not understood."),
+            }
+        } else {
+            match wallet_tools::verified_receipt(&value) {
+                Some((valid, signer)) => self.tools.set_verified(valid, signer),
+                None => self.tools.set_failure("The verification receipt was not understood."),
+            }
+        }
+    }
+
+    fn backup_receipt_text(&self, value: &serde_json::Value) -> Option<String> {
+        let (id, revision) = backend::checkpoint_of(value)?;
+        let wallet = self.state.wallet.as_ref()?;
+        let network = value["network"].as_str()?;
+        if id != wallet.wallet_id || network != wallet.network.as_str() {
+            return None;
+        }
+        Some(format!(
+            "Monario recovery receipt\nNetwork: {network}\nWallet id: {id}\nRevision: {revision}"
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -1321,9 +1605,30 @@ impl GuiApp {
     fn drain_jobs(&mut self) {
         while let Ok((tag, result)) = self.jobs.receiver.try_recv() {
             self.busy = self.busy.saturating_sub(1);
+            let mut cleanup_failed = false;
+            if matches!(tag, JobTag::Construct(_))
+                && let Some(path) = self.pending_request.take()
+            {
+                // The construct child has exited, so its bounded request file
+                // (which names shielded notes) is no longer needed on success or failure.
+                match std::fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => cleanup_failed = true,
+                }
+            }
             match result {
+                Err(error) if tag.is_tool() => self.finish_tool(tag, Err(error)),
                 Err(error) => self.error(error.to_string()),
+                Ok(value) if tag.is_tool() => self.finish_tool(tag, Ok(value)),
                 Ok(value) => self.handle(tag, value),
+            }
+            if cleanup_failed {
+                const NOTE: &str = "A temporary transaction request file could not be removed from the wallet folder. Delete it manually.";
+                match self.banner.as_mut() {
+                    Some(banner) => banner.text = format!("{} {NOTE}", banner.text),
+                    None => self.info(NOTE),
+                }
             }
         }
     }
@@ -1358,12 +1663,8 @@ impl GuiApp {
                 && current.name == wallet.name
         }) {
             self.balance = None;
-            self.coins.clear();
-            self.inputs_tip.clear();
-            self.inputs_height = None;
+            self.clear_send_inventory();
             self.addresses.clear();
-            self.send_coins.clear();
-            self.pending_request = None;
             self.construct = None;
             self.exported_hex.clear();
             self.last_status = None;
@@ -1497,7 +1798,10 @@ impl GuiApp {
                 }
                 None => self.error("the balance receipt was not understood"),
             },
-            JobTag::Inputs => {
+            JobTag::Inputs(scope) => {
+                if !self.unlocked || self.send_scope().as_ref() != Some(&scope) {
+                    return;
+                }
                 let tip = value["validated_tip"]
                     .as_str()
                     .filter(|tip| backend::validate_hex(tip, 32, "validated tip").is_ok());
@@ -1512,9 +1816,24 @@ impl GuiApp {
                     self.error("the chain source changed during scanning. Scan again.");
                     return;
                 }
+                if backend::checkpoint_of(&value).is_none_or(|(id, _)| id != scope.wallet_id) {
+                    self.clear_send_inventory();
+                    self.error("the wallet changed during scanning. Scan again.");
+                    return;
+                }
+                let notes = match backend::parse_private_notes(&value) {
+                    Ok(notes) => notes,
+                    Err(error) => {
+                        self.clear_send_inventory();
+                        self.error(format!("shielded notes were not understood: {error}"));
+                        return;
+                    }
+                };
                 self.coins = backend::parse_coins(&value);
+                self.private_notes = notes;
                 self.inputs_tip = tip.to_owned();
                 self.inputs_height = Some(height);
+                self.inputs_scope = Some(scope);
                 let valid: BTreeSet<_> = self
                     .coins
                     .iter()
@@ -1522,8 +1841,18 @@ impl GuiApp {
                     .map(|coin| (coin.transaction.clone(), coin.index))
                     .collect();
                 self.send_coins.retain(|key| valid.contains(key));
+                let valid_notes: BTreeSet<_> = self
+                    .private_notes
+                    .iter()
+                    .filter(|note| note.selectable())
+                    .map(|note| note.nullifier.clone())
+                    .collect();
+                self.send_notes.retain(|key| valid_notes.contains(key));
                 let spendable = self.coins.iter().filter(|coin| coin.selectable()).count();
-                self.success(format!("Scan complete. {spendable} spendable outputs."));
+                let shielded = valid_notes.len();
+                self.success(format!(
+                    "Scan complete. {spendable} spendable outputs and {shielded} unreserved private notes."
+                ));
             }
             JobTag::Discover => {
                 self.discovery_result = Some(value);
@@ -1551,14 +1880,24 @@ impl GuiApp {
                     );
                 }
             }
-            JobTag::Construct => {
-                if let Some(path) = self.pending_request.take() {
-                    let _ = std::fs::remove_file(path);
-                }
-                let Some(construct) = ConstructView::parse(&value) else {
+            JobTag::Construct(mode) => {
+                let Some(mut construct) = ConstructView::parse(&value) else {
                     self.error("the transaction receipt was not understood");
                     return;
                 };
+                construct.funding = mode;
+                let spent_coins = std::mem::take(&mut self.send_coins);
+                let spent_notes = std::mem::take(&mut self.send_notes);
+                for coin in &mut self.coins {
+                    if spent_coins.contains(&(coin.transaction.clone(), coin.index)) {
+                        coin.reserved = true;
+                    }
+                }
+                for note in &mut self.private_notes {
+                    if spent_notes.contains(&note.nullifier) {
+                        note.reserved = true;
+                    }
+                }
                 self.construct = Some(construct);
                 self.confirm_reserve = false;
                 self.success("Transaction signed. Inputs are reserved; review before submitting.");
@@ -1622,10 +1961,22 @@ impl GuiApp {
             JobTag::Backup => {
                 self.confirm.clear();
                 self.backup_password.clear();
-                self.success("Encrypted backup written. Keep the backup receipt safe.");
+                match self.backup_receipt_text(&value) {
+                    Some(receipt) => {
+                        self.backup_receipt = Some(receipt);
+                        self.success("Encrypted backup written. Keep the backup receipt safe.");
+                    }
+                    None => self.error(
+                        "Encrypted backup written, but its receipt was not understood. Verify the backup before relying on it.",
+                    ),
+                }
+            }
+            JobTag::ToolSign { .. } | JobTag::ToolVerify { .. } => {
+                self.finish_tool(tag, Ok(value));
             }
             JobTag::PullRemote => {
                 self.remote_result = Some(value);
+                self.clear_send_inventory();
                 self.success(
                     "Remote pages were validated and committed locally. Run Balance to scan them.",
                 );
@@ -1636,6 +1987,55 @@ impl GuiApp {
     // -----------------------------------------------------------------------
     // Node polling
     // -----------------------------------------------------------------------
+
+    pub(crate) fn live_chain_now(&self) -> Option<backend::LiveChain> {
+        let node = self.node.as_ref()?;
+        let status = self.node_status.as_ref()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        backend::live_chain(status, node.pid, &self.live_profile, now)
+    }
+
+    /// Last validated wallet scan height, shown only for the configured profile.
+    pub(crate) fn scanned_height(&self) -> Option<u64> {
+        let profile = self.state.source.profile.trim();
+        self.balance
+            .as_ref()
+            .filter(|balance| !profile.is_empty() && balance.profile == profile)
+            .map(|balance| balance.height)
+    }
+
+    /// Live height and peers, or waiting/not running placeholders. Never shows a
+    /// cached peer count as current.
+    pub(crate) fn chain_readout(
+        running: bool,
+        live: Option<&backend::LiveChain>,
+    ) -> (String, String) {
+        match live {
+            Some(chain) if running => (chain.height.to_string(), chain.peers.to_string()),
+            _ if running => ("waiting".to_owned(), "waiting".to_owned()),
+            _ => ("not running".to_owned(), "not running".to_owned()),
+        }
+    }
+
+    pub(crate) fn status_chain_text(
+        running: bool,
+        live: Option<&backend::LiveChain>,
+        scanned: Option<u64>,
+    ) -> String {
+        let mut text = if running {
+            let (height, peers) = Self::chain_readout(running, live);
+            format!("Local height {height} · Connected peers {peers}")
+        } else {
+            "Node not running".to_owned()
+        };
+        if let Some(height) = scanned {
+            text = format!("{text} · Last validated scan height {height}");
+        }
+        text
+    }
 
     fn poll_node(&mut self, ctx: &egui::Context) {
         if let Some(receiver) = &self.stop_rx {
@@ -1675,6 +2075,7 @@ impl GuiApp {
                 let tail = node.stderr_tail();
                 self.node = None;
                 self.node_kind = None;
+                self.node_status = None;
                 let rejected = terminal.as_ref().is_some_and(|status| {
                     status.pid == Some(pid)
                         && status
@@ -1695,8 +2096,9 @@ impl GuiApp {
                 }
             } else if self.last_poll.elapsed() >= Duration::from_millis(1000) {
                 self.last_poll = Instant::now();
-                if let Ok(status) = node.status() {
-                    self.node_status = Some(status);
+                match node.status() {
+                    Ok(status) => self.node_status = Some(status),
+                    Err(_) => self.node_status = None,
                 }
             }
         }
@@ -1810,10 +2212,12 @@ impl GuiApp {
                                 theme::divider(ui);
                                 ui.add_space(6.0);
                             }
-                            let selected = self.unlocked && self.page == page;
+                            // Tools is reachable while locked or in onboarding.
+                            let reachable = self.unlocked || page == Page::Tools;
+                            let selected = reachable && self.page == page;
                             let (rect, response) = ui.allocate_exact_size(
                                 Vec2::new(ui.available_width(), theme::CONTROL_HEIGHT),
-                                if self.unlocked {
+                                if reachable {
                                     egui::Sense::click()
                                 } else {
                                     egui::Sense::hover()
@@ -1822,19 +2226,19 @@ impl GuiApp {
                             response.widget_info(|| {
                                 egui::WidgetInfo::selected(
                                     egui::WidgetType::SelectableLabel,
-                                    self.unlocked,
+                                    reachable,
                                     selected,
                                     label,
                                 )
                             });
-                            let response = if self.unlocked {
+                            let response = if reachable {
                                 response.on_hover_cursor(egui::CursorIcon::PointingHand)
                             } else {
                                 response
                             };
                             let painter = ui.painter();
                             if selected
-                                || (self.unlocked && (response.hovered() || response.has_focus()))
+                                || (reachable && (response.hovered() || response.has_focus()))
                             {
                                 painter.rect_filled(
                                     rect,
@@ -1922,12 +2326,12 @@ impl GuiApp {
                         if let Some(node) = &self.node {
                             ui.label(theme::caption(&format!("pid {}", node.pid)));
                         }
-                        if let Some(status) = &self.node_status {
-                            ui.label(theme::caption(&format!(
-                                "height {} · {} peers",
-                                status.height, status.peers
-                            )));
-                        }
+                        let live = self.live_chain_now();
+                        ui.label(theme::caption(&Self::status_chain_text(
+                            self.node.is_some(),
+                            live.as_ref(),
+                            self.scanned_height(),
+                        )));
                     });
                 });
             });
@@ -1990,6 +2394,30 @@ impl GuiApp {
         });
     }
 
+    fn tools_screen(&mut self, ui: &mut egui::Ui) {
+        if !self.unlocked {
+            ui.horizontal(|ui| {
+                if ui.add(theme::button_secondary("Back")).clicked() {
+                    self.page = Page::Overview;
+                }
+            });
+            ui.add_space(8.0);
+        }
+        self.tools.set_busy(self.is_busy());
+        let snapshot = ConsoleSnapshot::new(
+            self.form_network.label(),
+            self.unlocked,
+            self.balance.as_ref().map(|balance| BalanceSnapshot {
+                transparent_atoms: balance.transparent,
+                private_atoms: balance.private,
+                height: balance.height,
+            }),
+        );
+        if let Some(action) = self.tools.show(ui, &snapshot) {
+            self.dispatch_tool(action);
+        }
+    }
+
     fn lock_screen(&mut self, ui: &mut egui::Ui) {
         ui.add_space(40.0);
         ui.vertical_centered(|ui| {
@@ -2050,6 +2478,9 @@ impl GuiApp {
                                     self.state.wallet = None;
                                     self.unlocked = false;
                                     self.password.clear();
+                                    self.tools_generation = self.tools_generation.wrapping_add(1);
+                                    self.tools.clear_sensitive();
+                                    self.backup_receipt = None;
                                     self.page = Page::Overview;
                                     self.info(
                                         "Saved shortcut cleared. Your wallet file is intact.",
@@ -2107,9 +2538,10 @@ impl eframe::App for GuiApp {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        if self.state.wallet.is_none() {
+                        let tools = self.page == Page::Tools;
+                        if self.state.wallet.is_none() && !tools {
                             self.onboarding(ui);
-                        } else if !self.unlocked {
+                        } else if !self.unlocked && !tools {
                             self.lock_screen(ui);
                         } else {
                             let available = ui.available_width();
@@ -2127,6 +2559,7 @@ impl eframe::App for GuiApp {
                                         Page::Mining => self.mining(ui),
                                         Page::Node => self.node(ui),
                                         Page::Settings => self.settings(ui),
+                                        Page::Tools => self.tools_screen(ui),
                                     }
                                 });
                             });
@@ -2220,6 +2653,79 @@ mod tests {
         );
     }
 
+    fn scanned_balance(profile: &str, height: u64) -> BalanceView {
+        BalanceView {
+            transparent: 0,
+            private: 0,
+            immature: 0,
+            height,
+            tip: "cd".repeat(32),
+            profile: profile.to_owned(),
+            full_chain_replay: false,
+            pending: 0,
+        }
+    }
+
+    #[test]
+    fn status_text_separates_live_values_from_waiting_and_scan_height() {
+        let live = backend::LiveChain {
+            height: 42,
+            tip: "ab".repeat(32),
+            peers: 3,
+        };
+        assert_eq!(
+            GuiApp::status_chain_text(true, Some(&live), None),
+            "Local height 42 · Connected peers 3"
+        );
+        assert_eq!(
+            GuiApp::status_chain_text(true, None, Some(7)),
+            "Local height waiting · Connected peers waiting · Last validated scan height 7"
+        );
+        assert_eq!(
+            GuiApp::status_chain_text(false, Some(&live), None),
+            "Node not running"
+        );
+        assert_eq!(
+            GuiApp::status_chain_text(false, None, Some(7)),
+            "Node not running · Last validated scan height 7"
+        );
+        assert_eq!(
+            GuiApp::chain_readout(true, None),
+            ("waiting".to_owned(), "waiting".to_owned())
+        );
+        assert_eq!(
+            GuiApp::chain_readout(false, Some(&live)),
+            ("not running".to_owned(), "not running".to_owned())
+        );
+    }
+
+    #[test]
+    fn scanned_height_is_scoped_to_the_configured_profile() {
+        let mut app = GuiApp::from_state(PersistedState::default());
+        app.balance = Some(scanned_balance(&"11".repeat(32), 9));
+        assert_eq!(app.scanned_height(), None);
+        app.state.source.profile = "11".repeat(32);
+        assert_eq!(app.scanned_height(), Some(9));
+        app.state.source.profile = "22".repeat(32);
+        assert_eq!(app.scanned_height(), None);
+    }
+
+    #[test]
+    fn overview_shows_scan_height_without_live_node_values_when_offline() {
+        let overview = labels(|app, ui| {
+            app.state.source.profile = "11".repeat(32);
+            app.balance = Some(scanned_balance(&"11".repeat(32), 9));
+            app.overview(ui);
+        });
+        assert!(
+            overview
+                .iter()
+                .any(|label| label == "Last validated scan height")
+        );
+        assert!(!overview.iter().any(|label| label == "Local height"));
+        assert!(!overview.iter().any(|label| label == "Connected peers"));
+    }
+
     #[test]
     fn mining_status_fits_beside_setup_or_stacks_below_it() {
         fn find_text(shape: &egui::Shape, label: &str) -> Option<egui::Pos2> {
@@ -2290,6 +2796,97 @@ mod tests {
         let solo = labels(GuiApp::mining);
         assert!(solo.iter().any(|label| label == "Payout address"));
         assert!(!solo.iter().any(|label| label == "Pool credential"));
+    }
+
+    fn scanned_shielded_app() -> GuiApp {
+        let mut app = GuiApp::from_state(PersistedState::default());
+        app.state.wallet = Some(WalletRef {
+            directory: "wallet".into(),
+            name: "primary".into(),
+            network: Network::Regtest,
+            wallet_id: "00".repeat(16),
+            revision: 1,
+        });
+        configure_scan_source(&mut app);
+        app.inputs_scope = app.send_scope();
+        app.inputs_tip = "cd".repeat(32);
+        app.inputs_height = Some(10);
+        app.private_notes = vec![backend::PrivateNote {
+            nullifier: "ab".repeat(32),
+            atoms: 5,
+            reserved: false,
+        }];
+        app.send_notes.insert("ab".repeat(32));
+        app
+    }
+
+    #[test]
+    fn send_selection_clears_on_account_source_or_lock_change() {
+        let mut app = scanned_shielded_app();
+        app.reconcile_send_scope();
+        assert!(!app.send_notes.is_empty());
+
+        app.state.source.account = 1;
+        app.reconcile_send_scope();
+        assert!(app.send_notes.is_empty());
+        assert!(app.private_notes.is_empty());
+        assert!(app.inputs_height.is_none());
+        assert!(app.inputs_scope.is_none());
+
+        let mut app = scanned_shielded_app();
+        app.unlocked = true;
+        app.lock();
+        assert!(app.send_notes.is_empty());
+        assert!(app.private_notes.is_empty());
+        assert!(app.inputs_scope.is_none());
+    }
+
+    #[test]
+    fn switching_funding_pool_drops_the_other_pool_selection() {
+        let mut app = GuiApp::from_state(PersistedState::default());
+        app.send_notes.insert("ab".repeat(32));
+        app.send_coins.insert(("cd".repeat(32), 0));
+        app.set_send_mode(backend::FundingPool::Shielded);
+        assert!(app.send_coins.is_empty());
+        assert!(app.send_notes.is_empty());
+        assert_eq!(app.send_mode, backend::FundingPool::Shielded);
+    }
+
+    #[test]
+    fn shielded_draft_spends_only_selected_unreserved_notes() {
+        const PRIVATE: &str =
+            "rmonz1qypgluecd9cuke9cuaufjzxa367hm6f2drjcdg6dhrl2nx006gqkltnkw5904elwjstyd09ey8n3q4";
+        let mut app = scanned_shielded_app();
+        app.send_address = PRIVATE.into();
+        app.send_amount = "1".into();
+        app.send_fee = "0.001".into();
+        app.send_max_fee = "0.01".into();
+        app.private_notes = vec![
+            backend::PrivateNote {
+                nullifier: "aa".repeat(32),
+                atoms: 200_000_000,
+                reserved: false,
+            },
+            backend::PrivateNote {
+                nullifier: "bb".repeat(32),
+                atoms: 300_000_000,
+                reserved: true,
+            },
+        ];
+        app.send_notes.clear();
+        assert!(app.shielded_draft().is_err());
+
+        app.send_notes.insert("aa".repeat(32));
+        let plan = app.shielded_draft().unwrap();
+        assert_eq!(plan.selected_atoms, 200_000_000);
+        assert_eq!(plan.change_atoms, 99_900_000);
+
+        app.send_notes.insert("bb".repeat(32));
+        assert!(app.shielded_draft().is_err());
+        app.send_notes.remove(&"bb".repeat(32));
+
+        app.send_address = "rmont1qyqqqqgzqvzq2ps8pqys5zcvp58q7yq3zgfs7grwe7".into();
+        assert!(app.shielded_draft().is_err());
     }
 
     fn configure_scan_source(app: &mut GuiApp) {
