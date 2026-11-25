@@ -2,181 +2,275 @@
 //! boundary stays in one place.
 use crate::app::{GuiApp, NodeKind, OpenMode, Page, atom_text};
 use crate::backend::{self, AddressKind, Network, PoolMode};
-use crate::theme;
+use crate::{compact, theme};
 use eframe::egui::{self, Vec2};
 use zeroize::Zeroize;
 
-pub(crate) fn onboard_form(app: &mut GuiApp, ui: &mut egui::Ui) {
+pub(crate) fn onboard_form(app: &mut GuiApp, ui: &mut egui::Ui, short: bool) {
+    use OpenMode::{Create, Open, Recover};
+    ui.spacing_mut().item_spacing.y = if short { 4.0 } else { 6.0 };
     match app.open_mode {
-        OpenMode::Create => {
-            ui.label(theme::caption(
-                "Create a new encrypted wallet in a private local directory.",
-            ));
-            ui.add_space(6.0);
-            ui.label(theme::caption("Directory"));
-            theme::field(ui, &mut app.form_dir, "C:\\Monario\\wallet");
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                let half = (ui.available_width() - 10.0) * 0.5;
-                ui.allocate_ui_with_layout(
-                    Vec2::new(half, ui.available_height()),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        ui.label(theme::caption("Wallet name"));
-                        theme::field(ui, &mut app.form_name, "primary");
-                    },
-                );
-                ui.add_space(10.0);
-                ui.allocate_ui_with_layout(
-                    Vec2::new(half, ui.available_height()),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        ui.label(theme::caption("Network"));
-                        ui.label(app.form_network.label());
-                    },
-                );
+        Create => {
+            if !short {
+                ui.label(theme::caption(
+                    "Choose where to store your encrypted wallet.",
+                ));
+            }
+            folder_field(ui, "Wallet folder", &mut app.form_dir, true);
+            ui.label(theme::caption("Wallet name"));
+            theme::field(ui, &mut app.form_name, "primary");
+            ui.label(theme::caption("Use a password with 12 to 1024 bytes."));
+            ui.columns(2, |columns| {
+                columns[0].label(theme::caption("Password"));
+                password_entry(app, &mut columns[0], "Choose a password");
+                columns[1].label(theme::caption("Confirm password"));
+                password_confirm(app, &mut columns[1], "Repeat the password");
             });
-            ui.add_space(4.0);
-            ui.label(theme::caption("Password (12 to 1024 bytes)"));
-            password_entry(app, ui, "Choose a strong password");
-            ui.add_space(4.0);
-            ui.label(theme::caption("Confirm password"));
-            password_confirm(app, ui, "Repeat the password");
-            ui.add_space(10.0);
-            let enabled = !app.is_busy();
+            ui.checkbox(&mut app.reveal, "Show passwords");
+            ui.add_space(6.0);
             if ui
-                .add_enabled(enabled, theme::button_primary("Create encrypted wallet"))
+                .add(setup_button(ui, "Create encrypted wallet", true))
                 .clicked()
             {
                 app.create_wallet();
             }
-            ui.add_space(4.0);
-            ui.label(theme::caption(
-                "The directory is created with private permissions. No chain, genesis, listener or network is created.",
-            ));
         }
-        OpenMode::Open => {
-            ui.label(theme::caption(
-                "Open an existing wallet. The public selector (wallet id and revision) is required by the offline signer.",
-            ));
-            ui.add_space(6.0);
-            ui.label(theme::caption("Directory"));
-            theme::field(ui, &mut app.form_dir, "C:\\Monario\\wallet");
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                let half = (ui.available_width() - 10.0) * 0.5;
-                ui.allocate_ui_with_layout(
-                    Vec2::new(half, ui.available_height()),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        ui.label(theme::caption("Wallet name"));
-                        theme::field(ui, &mut app.form_name, "primary");
-                    },
-                );
-                ui.add_space(10.0);
-                ui.allocate_ui_with_layout(
-                    Vec2::new(half, ui.available_height()),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        ui.label(theme::caption("Network"));
-                        ui.label(app.form_network.label());
-                    },
-                );
-            });
-            ui.add_space(4.0);
-            ui.label(theme::caption("Wallet id (32 lowercase hex)"));
-            theme::field(ui, &mut app.form_wallet_id, "e.g. 0123…cdef");
-            ui.add_space(4.0);
-            ui.label(theme::caption("Revision"));
-            theme::field(ui, &mut app.form_revision, "0");
-            ui.add_space(4.0);
-            ui.label(theme::caption("Password"));
-            password_entry(app, ui, "Wallet password");
-            ui.add_space(10.0);
-            if ui
-                .add_enabled(!app.is_busy(), theme::button_primary("Unlock wallet"))
-                .clicked()
-            {
-                app.open_wallet();
+        Open | Recover => {
+            let recovery = app.open_mode == Recover;
+            let last_step = if recovery { 2 } else { 1 };
+            let step = app.setup_step;
+            if short {
+                ui.label(theme::caption(match (recovery, step) {
+                    (_, 0) => "Files",
+                    (true, 1) => "Recovery destination",
+                    _ => "Passwords",
+                }));
             }
-        }
-        OpenMode::Recover => {
-            ui.label(theme::caption(
-                "Recover a new wallet from an encrypted backup in the same directory. The backup receipt's wallet id and revision are required. Recovery keeps issuance locked until trusted scan verification.",
-            ));
-            ui.add_space(6.0);
-            ui.label(theme::caption("Directory (backup and new wallet)"));
-            theme::field(ui, &mut app.form_dir, "C:\\Monario\\wallet");
-            ui.add_space(4.0);
-            ui.label(theme::caption("Backup source directory (optional)"));
-            theme::field(ui, &mut app.form_recover_source, "Blank uses the directory above");
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                let half = (ui.available_width() - 10.0) * 0.5;
-                ui.allocate_ui_with_layout(
-                    Vec2::new(half, ui.available_height()),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        ui.label(theme::caption("Backup name"));
-                        theme::field(ui, &mut app.form_backup_name, "snapshot");
-                    },
-                );
-                ui.add_space(10.0);
-                ui.allocate_ui_with_layout(
-                    Vec2::new(half, ui.available_height()),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        ui.label(theme::caption("New wallet name"));
-                        theme::field(ui, &mut app.form_new_name, "restored");
-                    },
-                );
-            });
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                let half = (ui.available_width() - 10.0) * 0.5;
-                ui.allocate_ui_with_layout(
-                    Vec2::new(half, ui.available_height()),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        ui.label(theme::caption("Network"));
-                        ui.label(app.form_network.label());
-                    },
-                );
-                ui.add_space(10.0);
-                ui.allocate_ui_with_layout(
-                    Vec2::new(half, ui.available_height()),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        ui.label(theme::caption("Backup wallet id"));
-                        theme::field(ui, &mut app.form_wallet_id, "32 lowercase hex");
-                    },
-                );
-            });
-            ui.add_space(4.0);
-            ui.label(theme::caption("Backup revision"));
-            theme::field(ui, &mut app.form_revision, "0");
-            ui.add_space(4.0);
-            ui.label(theme::caption("Backup password"));
-            password_entry(app, ui, "Backup password");
-            ui.add_space(4.0);
-            ui.label(theme::caption("New password (12 to 1024 bytes)"));
-            new_password_entry(app, ui, "New wallet password");
-            ui.add_space(4.0);
-            ui.label(theme::caption("Confirm new password"));
-            password_confirm(app, ui, "Repeat the new password");
-            ui.add_space(10.0);
-            if ui
-                .add_enabled(!app.is_busy(), theme::button_primary("Recover backup"))
-                .clicked()
-            {
-                app.recover_wallet();
+            if !short || (step == 0 && !app.setup_manual) {
+                let (directory, name) = if recovery {
+                    (&mut app.form_recover_source, &mut app.form_backup_name)
+                } else {
+                    (&mut app.form_dir, &mut app.form_name)
+                };
+                let title = if recovery {
+                    "Choose backup file…"
+                } else {
+                    "Choose wallet file…"
+                };
+                if ui.add(setup_button(ui, title, false)).clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .set_title(title)
+                        .add_filter("Monario wallet files", &["monw"])
+                        .pick_file()
+                {
+                    match crate::onboarding_files::wallet_selection(&path) {
+                        Ok((folder, selected)) => {
+                            if *directory != folder || *name != selected {
+                                *directory = folder;
+                                *name = selected;
+                                app.form_wallet_id.clear();
+                                app.form_revision = "0".into();
+                                if !recovery
+                                    && let Some(saved) = &app.state.wallet
+                                    && saved.network == app.form_network
+                                    && saved.directory == *directory
+                                    && saved.name == *name
+                                {
+                                    app.form_wallet_id.clone_from(&saved.wallet_id);
+                                    app.form_revision = saved.revision.to_string();
+                                }
+                            }
+                        }
+                        Err(error) => app.error(error),
+                    }
+                }
+                let (directory, name) = if recovery {
+                    (&app.form_recover_source, &app.form_backup_name)
+                } else {
+                    (&app.form_dir, &app.form_name)
+                };
+                if !directory.is_empty() && !name.is_empty() {
+                    ui.label(format!("{name}.monw"));
+                    let label = egui::Label::new(theme::caption(directory));
+                    if short {
+                        ui.add(label.truncate()).on_hover_text(directory);
+                    } else {
+                        ui.add(label.wrap());
+                    }
+                }
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    let title = if recovery {
+                        "Load recovery receipt…"
+                    } else {
+                        "Load wallet receipt…"
+                    };
+                    if ui.add(setup_button(ui, title, false)).clicked()
+                        && let Some(path) = rfd::FileDialog::new()
+                            .set_title(title)
+                            .add_filter("Receipt text files", &["txt"])
+                            .pick_file()
+                    {
+                        match crate::onboarding_files::read_receipt(&path, app.form_network) {
+                            Ok((id, revision)) => {
+                                app.form_wallet_id = id;
+                                app.form_revision = revision.to_string();
+                            }
+                            Err(error) => app.error(error),
+                        }
+                    }
+                    if !app.form_wallet_id.is_empty() {
+                        ui.label(theme::caption(&format!(
+                            "Receipt revision {}",
+                            app.form_revision
+                        )));
+                    }
+                });
+            }
+            if !short {
+                ui.collapsing("Enter file or receipt details manually", |ui| {
+                    setup_manual(app, ui, recovery);
+                });
+            } else if step == 0 {
+                if app.setup_manual {
+                    setup_manual(app, ui, recovery);
+                }
+                let label = if app.setup_manual {
+                    "Use file pickers"
+                } else {
+                    "Enter details manually"
+                };
+                if ui.add(setup_button(ui, label, false)).clicked() {
+                    app.setup_manual = !app.setup_manual;
+                }
+            }
+            if recovery && (!short || step == 1) {
+                folder_field(ui, "New wallet folder", &mut app.form_dir, true);
+                ui.label(theme::caption("New wallet name"));
+                theme::field(ui, &mut app.form_new_name, "restored");
+            }
+            if short && step < last_step {
+                let next = if recovery && step == 0 {
+                    "Next: destination"
+                } else {
+                    "Next: password"
+                };
+                ui.horizontal_wrapped(|ui| {
+                    if step > 0 && ui.add(setup_button(ui, "Back", false)).clicked() {
+                        app.setup_step -= 1;
+                    }
+                    if ui.add(setup_button(ui, next, true)).clicked() {
+                        app.setup_manual = false;
+                        app.setup_step += 1;
+                    }
+                });
+                return;
             }
             ui.add_space(4.0);
-            ui.label(theme::caption(
-                "The backup file is never modified. A recovered wallet keeps its issuance lock until a trusted scan verifies history.",
-            ));
+            if recovery {
+                password_label(ui, "Backup password", &mut app.reveal);
+                password_entry(app, ui, "Backup password");
+                ui.columns(2, |columns| {
+                    columns[0].label(theme::caption("New password"));
+                    new_password_entry(app, &mut columns[0], "New wallet password");
+                    columns[1].label(theme::caption("Confirm new password"));
+                    password_confirm(app, &mut columns[1], "Repeat the new password");
+                });
+            } else {
+                password_label(ui, "Password", &mut app.reveal);
+                password_entry(app, ui, "Wallet password");
+            }
+            ui.add_space(6.0);
+            let ready = !app.form_dir.trim().is_empty() && !app.form_wallet_id.trim().is_empty();
+            ui.horizontal_wrapped(|ui| {
+                if short && ui.add(setup_button(ui, "Back", false)).clicked() {
+                    app.setup_step -= 1;
+                }
+                if recovery {
+                    if ui
+                        .add_enabled(ready, setup_button(ui, "Recover wallet", true))
+                        .clicked()
+                    {
+                        app.recover_wallet();
+                    }
+                } else if ui
+                    .add_enabled(ready, setup_button(ui, "Unlock wallet", true))
+                    .clicked()
+                {
+                    app.open_wallet();
+                }
+            });
         }
     }
+}
+
+fn setup_manual(app: &mut GuiApp, ui: &mut egui::Ui, recovery: bool) {
+    ui.columns(2, |columns| {
+        {
+            let ui = &mut columns[0];
+            if recovery {
+                ui.label(theme::caption(
+                    "Backup folder (blank uses the wallet folder)",
+                ));
+                theme::field(ui, &mut app.form_recover_source, "Backup folder");
+                ui.label(theme::caption("Backup name"));
+                theme::field(ui, &mut app.form_backup_name, "snapshot");
+            } else {
+                ui.label(theme::caption("Wallet folder"));
+                theme::field(ui, &mut app.form_dir, "Wallet folder");
+                ui.label(theme::caption("Wallet name"));
+                theme::field(ui, &mut app.form_name, "primary");
+            }
+        }
+        let ui = &mut columns[1];
+        ui.label(theme::caption("Wallet ID from your receipt"));
+        theme::field(ui, &mut app.form_wallet_id, "32 lowercase hex characters");
+        ui.label(theme::caption("Receipt revision"));
+        theme::field(ui, &mut app.form_revision, "0");
+    });
+}
+
+fn setup_button(ui: &egui::Ui, title: &str, primary: bool) -> egui::Button<'static> {
+    let button = if primary {
+        theme::button_primary(title)
+    } else {
+        theme::button_secondary(title)
+    };
+    button.min_size(Vec2::splat(ui.spacing().interact_size.y))
+}
+
+fn password_label(ui: &mut egui::Ui, label: &str, reveal: &mut bool) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(theme::caption(label));
+        ui.checkbox(reveal, "Show passwords");
+    });
+}
+
+fn folder_field(ui: &mut egui::Ui, label: &str, folder: &mut String, wallet_subfolder: bool) {
+    ui.label(theme::caption(label));
+    ui.horizontal(|ui| {
+        if ui.add(setup_button(ui, "Browse…", false)).clicked()
+            && let Some(path) = rfd::FileDialog::new().set_title(label).pick_folder()
+        {
+            let path = if wallet_subfolder { path.join("Monario Wallets") } else { path };
+            if let Some(text) = path.to_str() {
+                *folder = text.to_owned();
+            }
+        }
+        theme::field(ui, folder, "No folder selected");
+    });
+}
+
+fn save_receipt(ui: &mut egui::Ui, receipt: &str, file_name: &str) -> Option<Result<(), String>> {
+    if !ui.add(theme::button_secondary("Save receipt…")).clicked() {
+        return None;
+    }
+    rfd::FileDialog::new()
+        .set_title("Save Monario receipt")
+        .set_file_name(file_name)
+        .add_filter("Receipt text file", &["txt"])
+        .save_file()
+        .map(|path| crate::onboarding_files::save_receipt(&path, receipt))
 }
 
 fn password_entry(app: &mut GuiApp, ui: &mut egui::Ui, hint: &str) {
@@ -204,9 +298,11 @@ fn new_password_entry(app: &mut GuiApp, ui: &mut egui::Ui, hint: &str) {
 }
 
 fn page_header(ui: &mut egui::Ui, title: &str, subtitle: &str) {
-    ui.label(theme::title(title));
-    ui.label(theme::subtitle(subtitle));
-    ui.add_space(14.0);
+    if !compact::is_active(ui) {
+        ui.label(theme::title(title));
+        ui.label(theme::subtitle(subtitle));
+        ui.add_space(14.0);
+    }
 }
 
 fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
@@ -215,6 +311,26 @@ fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
         add(ui);
     });
     ui.add_space(12.0);
+}
+
+fn spendable_rows(
+    ui: &mut egui::Ui,
+    id: &'static str,
+    len: usize,
+    render: impl FnOnce(&mut egui::Ui, std::ops::Range<usize>),
+) {
+    if compact::is_active(ui) {
+        let range = compact::list(ui, id, len, 3);
+        render(ui, range);
+    } else {
+        egui::ScrollArea::vertical().max_height(190.0).show(ui, |ui| render(ui, 0..len));
+    }
+}
+
+fn section_card(ui: &mut egui::Ui, tab: &str, add: impl FnOnce(&mut egui::Ui)) {
+    if compact::includes(ui, tab) {
+        card(ui, add);
+    }
 }
 
 impl GuiApp {
@@ -239,8 +355,7 @@ impl GuiApp {
         let mut go_node = false;
         let mut stop = false;
 
-        theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
+        section_card(ui, "Balance", |ui| {
             ui.label(theme::section("Confirmed balance"));
             if let Some(balance) = &balance {
                 ui.label(theme::amount(&format!("{} MONAR", backend::format_monar(balance.total()))));
@@ -286,7 +401,7 @@ impl GuiApp {
         ui.add_space(12.0);
 
         let mut receive = |ui: &mut egui::Ui| {
-            card(ui, |ui| {
+            section_card(ui, "Receive", |ui| {
                 ui.label(theme::section("Receive"));
                 if let Some(address) = &address {
                     ui.label(theme::caption(if address.kind == "private" {
@@ -309,7 +424,7 @@ impl GuiApp {
             });
         };
         let mut node = |ui: &mut egui::Ui| {
-            card(ui, |ui| {
+            section_card(ui, "Local node", |ui| {
                 ui.label(theme::section("Local node"));
                 ui.label(theme::subtitle(if node_running {
                     "Running"
@@ -341,7 +456,7 @@ impl GuiApp {
                 }
             });
         };
-        if ui.available_width() >= 720.0 {
+        if !compact::is_active(ui) && ui.available_width() >= 720.0 {
             ui.columns(2, |columns| {
                 receive(&mut columns[0]);
                 node(&mut columns[1]);
@@ -369,8 +484,11 @@ impl GuiApp {
             self.page = Page::Node;
         }
 
+        if compact::is_active(ui) && compact::includes(ui, "Activity") && self.activity.is_empty() {
+            ui.label(theme::caption("No wallet activity in this session."));
+        }
         if !self.activity.is_empty() {
-            card(ui, |ui| {
+            section_card(ui, "Activity", |ui| {
                 ui.label(theme::section("RECENT ACTIVITY"));
                 ui.add_space(4.0);
                 for entry in self.activity.iter().rev().take(6) {
@@ -390,7 +508,7 @@ impl GuiApp {
 
         let busy = self.is_busy();
         let mut chosen = self.send_mode;
-        card(ui, |ui| {
+        section_card(ui, "Funds", |ui| {
             ui.label(theme::section("Funding pool"));
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
@@ -431,7 +549,7 @@ impl GuiApp {
         let mut sign = false;
 
         let mut funding = |app: &mut Self, ui: &mut egui::Ui| {
-            card(ui, |ui| {
+            section_card(ui, "Funds", |ui| {
                 ui.label(theme::section("Spendable funds"));
                 ui.horizontal_wrapped(|ui| {
                     if scan_configured {
@@ -461,7 +579,7 @@ impl GuiApp {
             });
 
             if mode == backend::FundingPool::Shielded {
-                card(ui, |ui| {
+                section_card(ui, "Funds", |ui| {
                     ui.label(theme::section("Select private notes"));
                     ui.label(theme::caption(
                         "Each note is shown by its amount only. Reserved notes belong to a signed transaction and can't be selected.",
@@ -474,10 +592,9 @@ impl GuiApp {
                             "Notes appear here after scanning."
                         }));
                     } else {
-                        egui::ScrollArea::vertical()
-                            .max_height(190.0)
-                            .show(ui, |ui| {
-                                for (index, note) in notes.iter().enumerate() {
+                        spendable_rows(ui, "shielded-notes", notes.len(), |ui, range| {
+                                for index in range {
+                                    let note = &notes[index];
                                     let mut selected = app.send_notes.contains(&note.nullifier);
                                     ui.horizontal_wrapped(|ui| {
                                         if ui
@@ -506,7 +623,7 @@ impl GuiApp {
                     }
                 });
             } else {
-            card(ui, |ui| {
+            section_card(ui, "Funds", |ui| {
                 ui.label(theme::section("Select transparent outputs"));
                 ui.label(theme::caption(
                 "Select outputs that are mature and aren't already reserved by a signed transaction.",
@@ -519,10 +636,8 @@ impl GuiApp {
                         "Outputs appear here after scanning."
                     }));
                 } else {
-                    egui::ScrollArea::vertical()
-                        .max_height(190.0)
-                        .show(ui, |ui| {
-                            for coin in &coins {
+                    spendable_rows(ui, "transparent-outputs", coins.len(), |ui, range| {
+                            for coin in &coins[range] {
                                 let key = (coin.transaction.clone(), coin.index);
                                 let mut selected = app.send_coins.contains(&key);
                                 ui.horizontal_wrapped(|ui| {
@@ -568,7 +683,7 @@ impl GuiApp {
                     .filter(|note| app.send_notes.contains(&note.nullifier))
                     .fold(0u64, |sum, note| sum.saturating_add(note.atoms)),
             };
-            card(ui, |ui| {
+            section_card(ui, "Payment", |ui| {
                 ui.label(theme::section("Payment details"));
                 ui.add_space(4.0);
                 ui.label(theme::caption("Recipient address"));
@@ -685,7 +800,7 @@ impl GuiApp {
             }
             });
         };
-        if ui.available_width() >= 780.0 {
+        if !compact::is_active(ui) && ui.available_width() >= 780.0 {
             ui.columns(2, |columns| {
                 funding(self, &mut columns[1]);
                 payment(self, &mut columns[0]);
@@ -695,14 +810,14 @@ impl GuiApp {
             payment(self, ui);
         }
 
-        egui::CollapsingHeader::new("Fee estimator").show(ui, |ui| {
+        let mut estimator = |ui: &mut egui::Ui| {
             card(ui, |ui| {
             ui.label(theme::caption(
                 "Historical fee samples from the active validated branch. This is a heuristic, not mempool policy or an inclusion guarantee.",
             ));
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                let quarter = (ui.available_width() - 30.0) / 4.0;
+                let quarter = (ui.available_width() - 3.0 * (ui.spacing().item_spacing.x + 10.0)) / 4.0;
                 ui.allocate_ui_with_layout(
                     Vec2::new(quarter, ui.available_height()),
                     egui::Layout::top_down(egui::Align::LEFT),
@@ -771,10 +886,23 @@ impl GuiApp {
                 theme::key_value(ui, "Suggested atoms", &text("suggested_fee_atoms"));
             }
             });
-        });
+        };
+        if compact::is_active(ui) {
+            if compact::includes(ui, "Fees") {
+                estimator(ui);
+            }
+        } else {
+            egui::CollapsingHeader::new("Fee estimator").show(ui, estimator);
+        }
 
+        if compact::is_active(ui) && compact::includes(ui, "Signed") && construct.is_none() {
+            ui.label(theme::caption("No transaction has been signed in this session."));
+        }
+        if compact::is_active(ui) && compact::includes(ui, "Status") && self.last_status.is_none() {
+            ui.label(theme::caption("Check a signed transaction to see its status here."));
+        }
         if let Some(construct) = &construct {
-            card(ui, |ui| {
+            section_card(ui, "Signed", |ui| {
                 ui.label(theme::section("SIGNED TRANSACTION"));
                 ui.add_space(4.0);
                 theme::key_value(ui, "Funding", construct.funding.label());
@@ -823,7 +951,7 @@ impl GuiApp {
         }
 
         if let Some(status) = &self.last_status {
-            card(ui, |ui| {
+            section_card(ui, "Status", |ui| {
                 ui.label(theme::section("TRANSACTION STATE"));
                 render_json_summary(ui, status);
             });
@@ -848,7 +976,7 @@ impl GuiApp {
         let mut private = false;
         let mut copy: Option<String> = None;
 
-        card(ui, |ui| {
+        section_card(ui, "New address", |ui| {
             ui.label(theme::section("NEW RECEIVE ADDRESS"));
             ui.label(theme::caption("Use a fresh address for each payment."));
             ui.add_space(8.0);
@@ -868,12 +996,17 @@ impl GuiApp {
             });
         });
 
-        if self.addresses.is_empty() {
+        if compact::includes(ui, "Addresses") && self.addresses.is_empty() {
             card(ui, |ui| {
                 ui.label(theme::caption("No address derived in this session yet."));
             });
-        } else {
-            for address in &self.addresses {
+        } else if compact::includes(ui, "Addresses") {
+            let range = if compact::is_active(ui) {
+                compact::list(ui, "receive-addresses", self.addresses.len(), 1)
+            } else {
+                0..self.addresses.len()
+            };
+            for address in &self.addresses[range] {
                 card(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(theme::section(address.kind.to_uppercase().as_str()));
@@ -919,72 +1052,83 @@ impl GuiApp {
         let mut stop = false;
 
         let width = ui.available_width();
+        let is_compact = compact::is_active(ui);
+        let show_setup = compact::includes(ui, "Setup");
+        let show_start = compact::includes(ui, "Start");
+        let show_status = compact::includes(ui, "Status");
         let mut render = |ui: &mut egui::Ui| {
             let mut setup = |ui: &mut egui::Ui| {
                 card(ui, |ui| {
-                    ui.label(theme::section("Mining mode"));
-                    ui.horizontal_wrapped(|ui| {
-                        for option in PoolMode::ALL {
-                            let label = option.label();
-                            if theme::choice(
-                                ui,
-                                label,
-                                label,
-                                self.state.mining_pool_mode == option,
-                            )
-                            .clicked()
-                                && self.state.mining_pool_mode != option
-                            {
-                                self.pool_credential.zeroize();
-                                self.state.mining_pool_mode = option;
+                    if show_setup {
+                        ui.label(theme::section("Mining mode"));
+                        ui.horizontal_wrapped(|ui| {
+                            for option in PoolMode::ALL {
+                                let label = option.label();
+                                if theme::choice(
+                                    ui,
+                                    label,
+                                    label,
+                                    self.state.mining_pool_mode == option,
+                                )
+                                .clicked()
+                                    && self.state.mining_pool_mode != option
+                                {
+                                    self.pool_credential.zeroize();
+                                    self.state.mining_pool_mode = option;
+                                }
                             }
-                        }
-                    });
-                    if self.state.mining_pool_mode == PoolMode::Custom {
-                        ui.horizontal_top(|ui| {
-                            let width = ui.available_width();
-                            let gap = ui.spacing().item_spacing.x;
-                            let port_width = 106.0;
-                            ui.allocate_ui_with_layout(
-                                Vec2::new((width - port_width - gap).max(0.0), 0.0),
-                                egui::Layout::top_down(egui::Align::Min),
-                                |ui| {
-                                    ui.label(theme::caption("Pool host or IP"));
-                                    theme::field(
-                                        ui,
-                                        &mut self.state.mining_pool_address,
-                                        "pool.example.org",
-                                    );
-                                },
-                            );
-                            ui.vertical(|ui| {
-                                ui.label(theme::caption("Port"));
-                                theme::field(ui, &mut self.state.mining_pool_port, "19444");
-                            });
                         });
-                        ui.label(theme::caption("Pool credential"));
-                        let credential = theme::password_field(
-                            ui,
-                            &mut self.pool_credential,
-                            "Paste the credential from your pool",
-                        );
-                        if let Some(mut editor) =
-                            egui::TextEdit::load_state(ui.ctx(), credential.id)
-                        {
-                            editor.clear_undoer();
-                            egui::TextEdit::store_state(ui.ctx(), credential.id, editor);
+                        if self.state.mining_pool_mode == PoolMode::Custom {
+                            ui.horizontal_top(|ui| {
+                                let width = ui.available_width();
+                                let gap = ui.spacing().item_spacing.x;
+                                let port_width = 106.0;
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new((width - port_width - gap).max(0.0), 0.0),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        ui.label(theme::caption("Pool host or IP"));
+                                        theme::field(
+                                            ui,
+                                            &mut self.state.mining_pool_address,
+                                            "pool.example.org",
+                                        );
+                                    },
+                                );
+                                ui.vertical(|ui| {
+                                    ui.label(theme::caption("Port"));
+                                    theme::field(ui, &mut self.state.mining_pool_port, "19444");
+                                });
+                            });
+                            ui.label(theme::caption("Pool credential"));
+                            let credential = theme::password_field(
+                                ui,
+                                &mut self.pool_credential,
+                                "Paste the credential from your pool",
+                            );
+                            if let Some(mut editor) =
+                                egui::TextEdit::load_state(ui.ctx(), credential.id)
+                            {
+                                editor.clear_undoer();
+                                egui::TextEdit::store_state(ui.ctx(), credential.id, editor);
+                            }
+                            ui.label(theme::caption(
+                                "Ask your Monario pool operator for the credential and register your payout address with them.",
+                            ));
+                        } else {
+                            ui.label(theme::caption(
+                                "Use your own validated node to search for blocks.",
+                            ));
                         }
-                        ui.label(theme::caption(
-                            "Ask your Monario pool operator for the credential and register your payout address with them.",
-                        ));
-                    } else {
-                        ui.label(theme::caption(
-                            "Use your own validated node to search for blocks.",
-                        ));
                     }
-                    ui.add_space(8.0);
-                    theme::divider(ui);
-                    ui.add_space(5.0);
+                    if !show_start {
+                        return;
+                    }
+                    if show_setup {
+                        ui.add_space(8.0);
+                        theme::divider(ui);
+                        ui.add_space(5.0);
+                    }
                     if self.state.mining_pool_mode == PoolMode::Solo {
                         ui.label(theme::section("Payout address"));
                         let prefix = match self.form_network {
@@ -1041,9 +1185,11 @@ impl GuiApp {
                     } else {
                         "Leave unchecked to run the node locally without a peer listener."
                     });
-                    ui.add_space(8.0);
-                    theme::divider(ui);
-                    ui.add_space(4.0);
+                    if !is_compact {
+                        ui.add_space(8.0);
+                        theme::divider(ui);
+                        ui.add_space(4.0);
+                    }
                     if running {
                         stop = ui
                             .add_enabled(!busy, theme::button_danger(ui, "Stop mining"))
@@ -1087,7 +1233,7 @@ impl GuiApp {
                 })
             };
 
-            if width >= 780.0 {
+            if !is_compact && width >= 780.0 {
                 let gap = ui.spacing().item_spacing.x;
                 ui.allocate_ui_with_layout(
                     egui::vec2(width * 0.63 - gap, 0.0),
@@ -1096,11 +1242,15 @@ impl GuiApp {
                 );
                 ui.vertical(|ui| self.mining_status(ui, running));
             } else {
-                setup(ui);
-                self.mining_status(ui, running);
+                if show_setup || show_start {
+                    setup(ui);
+                }
+                if show_status {
+                    self.mining_status(ui, running);
+                }
             }
         };
-        if width >= 780.0 {
+        if !is_compact && width >= 780.0 {
             ui.horizontal_top(render);
         } else {
             render(ui);
@@ -1241,7 +1391,7 @@ impl GuiApp {
         let mut stop = false;
         let mut copy: Option<String> = None;
 
-        card(ui, |ui| {
+        section_card(ui, "Identity", |ui| {
             ui.label(theme::section("NODE IDENTITY"));
             ui.label(theme::caption(
                 "Set up a local node identity to sync and submit transactions.",
@@ -1254,7 +1404,7 @@ impl GuiApp {
             theme::field(ui, &mut self.node_profile, "64 lowercase hex");
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                let half = (ui.available_width() - 10.0) * 0.5;
+                let half = (ui.available_width() - ui.spacing().item_spacing.x - 10.0) * 0.5;
                 ui.allocate_ui_with_layout(
                     Vec2::new(half, ui.available_height()),
                     egui::Layout::top_down(egui::Align::LEFT),
@@ -1275,7 +1425,7 @@ impl GuiApp {
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                let half = (ui.available_width() - 10.0) * 0.5;
+                let half = (ui.available_width() - ui.spacing().item_spacing.x - 10.0) * 0.5;
                 ui.allocate_ui_with_layout(
                     Vec2::new(half, ui.available_height()),
                     egui::Layout::top_down(egui::Align::LEFT),
@@ -1320,7 +1470,7 @@ impl GuiApp {
                 create_inbox = true;
             }
         });
-        card(ui, |ui| {
+        section_card(ui, "Peers", |ui| {
             ui.label(theme::section("PINNED PEERS MANIFEST"));
             ui.label(theme::caption(
                 "Explicit pinned peers only. DNS names are rejected, the listener may be 'off', and automatic peer discovery is not implemented.",
@@ -1351,7 +1501,7 @@ impl GuiApp {
                 "The writer refuses to replace an existing peers file. Remove it explicitly to rotate pinned peers.",
             ));
         });
-        card(ui, |ui| {
+        section_card(ui, "Chain", |ui| {
             ui.label(theme::section("CHAIN SOURCE"));
             ui.label(theme::caption(
                 "Point at an existing, independently validated chain database and its manifest.",
@@ -1361,7 +1511,7 @@ impl GuiApp {
             theme::field(ui, &mut self.state.source.directory, "C:\\Monario\\chain");
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                let half = (ui.available_width() - 10.0) * 0.5;
+                let half = (ui.available_width() - ui.spacing().item_spacing.x - 10.0) * 0.5;
                 ui.allocate_ui_with_layout(
                     Vec2::new(half, ui.available_height()),
                     egui::Layout::top_down(egui::Align::LEFT),
@@ -1382,7 +1532,7 @@ impl GuiApp {
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                let third = (ui.available_width() - 20.0) / 3.0;
+                let third = (ui.available_width() - 2.0 * (ui.spacing().item_spacing.x + 10.0)) / 3.0;
                 ui.allocate_ui_with_layout(
                     Vec2::new(third, ui.available_height()),
                     egui::Layout::top_down(egui::Align::LEFT),
@@ -1435,7 +1585,7 @@ impl GuiApp {
                 ));
         });
 
-        card(ui, |ui| {
+        section_card(ui, "Remote scan", |ui| {
             ui.label(theme::section("REMOTE PAGE BOOTSTRAP"));
             ui.label(theme::caption(
                 "Pull pages from a node started with --enable-scan. Every block is fully validated and committed locally; no wallet or password is opened. Non-loopback endpoints require the node's published scan public key and use the encrypted, key-pinned scan transport.",
@@ -1450,7 +1600,7 @@ impl GuiApp {
             theme::field(ui, &mut self.state.remote_public_key, "64 lowercase hex");
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                let half = (ui.available_width() - 10.0) * 0.5;
+                let half = (ui.available_width() - ui.spacing().item_spacing.x - 10.0) * 0.5;
                 ui.allocate_ui_with_layout(
                     Vec2::new(half, ui.available_height()),
                     egui::Layout::top_down(egui::Align::LEFT),
@@ -1492,7 +1642,7 @@ impl GuiApp {
             ));
         });
 
-        card(ui, |ui| {
+        section_card(ui, "Runtime", |ui| {
             ui.horizontal(|ui| {
                 ui.label(theme::section("RUNTIME"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1537,8 +1687,11 @@ impl GuiApp {
             ));
         });
 
+        if compact::is_active(ui) && compact::includes(ui, "Live") && self.node_status.is_none() {
+            ui.label(theme::caption("No node status is available."));
+        }
         if let Some(status) = &self.node_status {
-            card(ui, |ui| {
+            section_card(ui, "Live", |ui| {
                 ui.label(theme::section("LIVE SNAPSHOT"));
                 let (height, peers) = GuiApp::chain_readout(true, live.as_ref());
                 theme::key_value(ui, "Local height", &height);
@@ -1555,7 +1708,12 @@ impl GuiApp {
                 if !status.candidates.is_empty() {
                     ui.add_space(6.0);
                     ui.label(theme::section("UNTRUSTED DISCOVERY CANDIDATES"));
-                    for candidate in &status.candidates {
+                    let range = if compact::is_active(ui) {
+                        compact::list(ui, "peer-candidates", status.candidates.len(), 3)
+                    } else {
+                        0..status.candidates.len()
+                    };
+                    for candidate in &status.candidates[range] {
                         ui.horizontal(|ui| {
                             ui.label(theme::mono(&candidate.address));
                             ui.label(theme::mono(&GuiApp::short(&candidate.public_key)));
@@ -1579,10 +1737,13 @@ impl GuiApp {
             self.success("Candidate JSON copied. Paste and validate it explicitly.");
         }
 
+        if compact::is_active(ui) && compact::includes(ui, "Logs") && self.node.is_none() {
+            ui.label(theme::caption("No node process is running."));
+        }
         if let Some(node) = &self.node {
             let stderr = node.stderr_tail();
             if !stderr.trim().is_empty() {
-                card(ui, |ui| {
+                section_card(ui, "Logs", |ui| {
                     ui.label(theme::section("RECENT STDERR"));
                     let mut text = stderr;
                     ui.add(
@@ -1622,7 +1783,7 @@ impl GuiApp {
         );
         let busy = self.is_busy();
 
-        card(ui, |ui| {
+        section_card(ui, "Wallet", |ui| {
             ui.label(theme::section("ACTIVE WALLET"));
             if let Some(wallet) = &self.state.wallet {
                 theme::key_value(ui, "Name", &wallet.name);
@@ -1651,7 +1812,7 @@ impl GuiApp {
             });
         });
 
-        card(ui, |ui| {
+        section_card(ui, "Password", |ui| {
             ui.label(theme::section("CHANGE PASSWORD"));
             ui.label(theme::caption(
                 "Re-encrypts the wallet. The wallet locks after a successful change.",
@@ -1678,7 +1839,7 @@ impl GuiApp {
                 self.change_password();
             }
         });
-        card(ui, |ui| {
+        section_card(ui, "Backup", |ui| {
             ui.label(theme::section("ENCRYPTED BACKUP"));
             ui.label(theme::caption(
                 "Creates a separate encrypted wallet copy with its own password and receipt.",
@@ -1687,8 +1848,7 @@ impl GuiApp {
             ui.label(theme::caption("Backup name"));
             theme::field(ui, &mut self.backup_name, "backup");
             ui.add_space(4.0);
-            ui.label(theme::caption("Backup destination (optional)"));
-            theme::field(ui, &mut self.backup_destination, "Blank keeps the default location");
+            folder_field(ui, "Backup destination (optional)", &mut self.backup_destination, false);
             ui.add_space(4.0);
             ui.label(theme::caption("Backup password"));
             if self.reveal {
@@ -1710,29 +1870,44 @@ impl GuiApp {
             {
                 self.backup_wallet();
             }
-            if let Some(receipt) = &self.backup_receipt {
+        });
+        section_card(ui, "Receipts", |ui| {
+            if compact::is_active(ui) {
+                ui.label(theme::section("WALLET RECEIPTS"));
+            }
+            if let Some(receipt) = self.backup_receipt.clone() {
                 ui.add_space(8.0);
                 ui.label(theme::caption(
                     "Recovery receipt. Keep it with the backup; recovery needs its wallet id and revision.",
                 ));
-                ui.add(egui::Label::new(theme::mono(receipt)).wrap());
+                ui.add(egui::Label::new(theme::mono(&receipt)).wrap());
                 if ui
                     .add(theme::button_secondary("Copy recovery receipt"))
                     .clicked()
                 {
                     ui.ctx().copy_text(receipt.clone());
                 }
+                self.report_receipt_save(save_receipt(ui, &receipt, "monario-recovery-receipt.txt"));
+            }
+            if let Some(wallet) = &self.state.wallet {
+                let receipt = format!(
+                    "Monario wallet receipt\nNetwork: {}\nWallet id: {}\nRevision: {}",
+                    wallet.network.as_str(), wallet.wallet_id, wallet.revision,
+                );
+                ui.add_space(8.0);
+                ui.label(theme::caption("Save the current wallet receipt to open this wallet on another computer."));
+                self.report_receipt_save(save_receipt(ui, &receipt, "monario-wallet-receipt.txt"));
             }
         });
 
-        card(ui, |ui| {
+        section_card(ui, "Discovery", |ui| {
             ui.label(theme::section("ACCOUNT DISCOVERY"));
             ui.label(theme::caption(
                 "Bounded transparent gap-limit discovery over the configured validated chain. Observed indices are a lower bound; unused issued addresses leave no chain trace.",
             ));
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                let quarter = (ui.available_width() - 30.0) / 4.0;
+                let quarter = (ui.available_width() - 3.0 * (ui.spacing().item_spacing.x + 10.0)) / 4.0;
                 ui.allocate_ui_with_layout(
                     Vec2::new(quarter, ui.available_height()),
                     egui::Layout::top_down(egui::Align::LEFT),
@@ -1822,7 +1997,7 @@ impl GuiApp {
             }
         });
 
-        card(ui, |ui| {
+        section_card(ui, "Helpers", |ui| {
             ui.label(theme::section("HELPER PROGRAMS"));
             let exe = std::env::current_exe()
                 .ok()
@@ -1850,7 +2025,7 @@ impl GuiApp {
             ));
         });
 
-        card(ui, |ui| {
+        section_card(ui, "Limits", |ui| {
             ui.horizontal(|ui| {
                 ui.label(theme::section("WALLET LIMITS"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

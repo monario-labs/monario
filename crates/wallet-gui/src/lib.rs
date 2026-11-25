@@ -10,6 +10,8 @@ pub mod backend;
 pub mod pages;
 pub mod state;
 pub mod theme;
+mod onboarding_files;
+mod compact;
 mod wallet_tools;
 
 use eframe::egui;
@@ -18,7 +20,7 @@ pub fn run() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1320.0, 860.0])
-            .with_min_inner_size([1040.0, 720.0])
+            .with_min_inner_size([540.0, 460.0])
             .with_icon(theme::brand_icon().clone())
             .with_title("Monario Wallet"),
         ..Default::default()

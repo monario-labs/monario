@@ -219,7 +219,20 @@ pub fn card(ui: &egui::Ui) -> egui::Frame {
         .fill(rgba(p.card))
         .stroke(Stroke::new(1.0, p.line))
         .corner_radius(CornerRadius::same(16))
-        .inner_margin(Margin::symmetric(24, 22))
+        .inner_margin(if ui.spacing().interact_size.y < CONTROL_HEIGHT {
+            Margin::symmetric(14, 10)
+        } else {
+            Margin::symmetric(24, 22)
+        })
+}
+
+pub(crate) fn compact_controls(ui: &mut egui::Ui) {
+    let style = ui.style_mut();
+    style.spacing.interact_size.y = 30.0;
+    style.spacing.item_spacing = Vec2::new(8.0, 4.0);
+    style.spacing.button_padding = Vec2::new(10.0, 4.0);
+    style.text_styles.insert(TextStyle::Body, FontId::proportional(14.0));
+    style.text_styles.insert(TextStyle::Button, FontId::proportional(13.0));
 }
 
 pub fn inset(ui: &egui::Ui) -> egui::Frame {
@@ -273,13 +286,13 @@ pub fn button_primary(text: &str) -> egui::Button<'static> {
     egui::Button::new(RichText::new(text.to_owned()).color(ON_GOLD).strong())
         .fill(GOLD)
         .corner_radius(CornerRadius::same(10))
-        .min_size(Vec2::splat(CONTROL_HEIGHT))
+        .min_size(Vec2::new(CONTROL_HEIGHT, 0.0))
 }
 
 pub fn button_secondary(text: &str) -> egui::Button<'static> {
     egui::Button::new(text.to_owned())
         .corner_radius(CornerRadius::same(10))
-        .min_size(Vec2::splat(CONTROL_HEIGHT))
+        .min_size(Vec2::new(CONTROL_HEIGHT, 0.0))
 }
 
 pub fn button_danger(ui: &egui::Ui, text: &str) -> egui::Button<'static> {
@@ -287,7 +300,7 @@ pub fn button_danger(ui: &egui::Ui, text: &str) -> egui::Button<'static> {
     egui::Button::new(RichText::new(text.to_owned()).color(p.danger))
         .fill(p.danger_fill)
         .corner_radius(CornerRadius::same(10))
-        .min_size(Vec2::splat(CONTROL_HEIGHT))
+        .min_size(Vec2::new(CONTROL_HEIGHT, 0.0))
 }
 
 pub fn choice(ui: &mut egui::Ui, label: &str, name: &str, selected: bool) -> egui::Response {
@@ -296,7 +309,7 @@ pub fn choice(ui: &mut egui::Ui, label: &str, name: &str, selected: bool) -> egu
         egui::Button::new(RichText::new(label).color(if selected { p.accent } else { p.text }))
             .selected(selected)
             .corner_radius(CornerRadius::same(10))
-            .min_size(Vec2::splat(CONTROL_HEIGHT)),
+            .min_size(Vec2::new(CONTROL_HEIGHT, 0.0)),
     );
     response.widget_info(|| {
         egui::WidgetInfo::selected(
@@ -318,23 +331,25 @@ pub fn choice(ui: &mut egui::Ui, label: &str, name: &str, selected: bool) -> egu
 }
 
 pub fn field(ui: &mut egui::Ui, value: &mut String, hint: &str) -> egui::Response {
+    let height = ui.spacing().interact_size.y;
     ui.add(
         egui::TextEdit::singleline(value)
             .hint_text(RichText::new(hint).color(palette(ui.ctx().theme()).muted))
             .desired_width(f32::INFINITY)
-            .min_size(Vec2::new(0.0, CONTROL_HEIGHT))
-            .margin(Margin::symmetric(12, 10)),
+            .min_size(Vec2::new(0.0, height))
+            .margin(if height < CONTROL_HEIGHT { Margin::symmetric(10, 4) } else { Margin::symmetric(12, 10) }),
     )
 }
 
 pub fn password_field(ui: &mut egui::Ui, value: &mut String, hint: &str) -> egui::Response {
+    let height = ui.spacing().interact_size.y;
     ui.add(
         egui::TextEdit::singleline(value)
             .password(true)
             .hint_text(RichText::new(hint).color(palette(ui.ctx().theme()).muted))
             .desired_width(f32::INFINITY)
-            .min_size(Vec2::new(0.0, CONTROL_HEIGHT))
-            .margin(Margin::symmetric(12, 10)),
+            .min_size(Vec2::new(0.0, height))
+            .margin(if height < CONTROL_HEIGHT { Margin::symmetric(10, 4) } else { Margin::symmetric(12, 10) }),
     )
 }
 
@@ -344,11 +359,12 @@ pub fn multiline_field(
     hint: &str,
     rows: usize,
 ) -> egui::Response {
+    let height = ui.spacing().interact_size.y;
     ui.add(
         egui::TextEdit::multiline(value)
             .hint_text(RichText::new(hint).color(palette(ui.ctx().theme()).muted))
             .desired_width(f32::INFINITY)
-            .min_size(Vec2::new(0.0, CONTROL_HEIGHT))
+            .min_size(Vec2::new(0.0, height))
             .desired_rows(rows)
             .margin(Margin::symmetric(12, 10)),
     )
@@ -362,6 +378,11 @@ pub fn divider(ui: &mut egui::Ui) {
 }
 
 pub fn key_value(ui: &mut egui::Ui, key: &str, value: &str) {
+    if ui.available_width() < 280.0 || value.len() > 45 {
+        ui.label(caption(key));
+        ui.add(egui::Label::new(mono(value)).wrap());
+        return;
+    }
     ui.horizontal(|ui| {
         ui.label(caption(key));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

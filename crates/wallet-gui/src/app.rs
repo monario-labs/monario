@@ -20,8 +20,10 @@ use zeroize::{Zeroize, Zeroizing};
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const SIDEBAR_WIDTH: f32 = 186.0;
+const COMPACT_WIDTH: f32 = 780.0;
+const COMPACT_HEIGHT: f32 = 660.0;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum Page {
     Overview,
     Send,
@@ -309,6 +311,9 @@ pub struct GuiApp {
 
     // Onboarding
     pub(crate) open_mode: OpenMode,
+    choosing_wallet: bool,
+    pub(crate) setup_step: usize,
+    pub(crate) setup_manual: bool,
     pub(crate) form_dir: String,
     pub(crate) form_name: String,
     pub(crate) form_network: Network,
@@ -411,6 +416,9 @@ impl GuiApp {
             unlocked: false,
             reveal: false,
             open_mode: OpenMode::Create,
+            choosing_wallet: false,
+            setup_step: 0,
+            setup_manual: false,
             form_dir: String::new(),
             form_name: "primary".into(),
             form_network: state.network(),
@@ -686,6 +694,34 @@ impl GuiApp {
         backend::plan_shielded(&self.private_notes, &selected, amount, fee, max_fee)
     }
 
+    fn set_onboarding_mode(&mut self, mode: OpenMode) {
+        if mode == self.open_mode {
+            return;
+        }
+        self.open_mode = mode;
+        self.setup_step = 0;
+        self.setup_manual = false;
+        self.form_dir.clear();
+        self.form_name = "primary".into();
+        self.form_recover_source.clear();
+        self.form_backup_name = "snapshot".into();
+        self.form_new_name = "restored".into();
+        self.form_wallet_id.clear();
+        self.form_revision = "0".into();
+        self.password.zeroize();
+        self.new_password.zeroize();
+        self.confirm.zeroize();
+        self.reveal = false;
+    }
+
+    pub(crate) fn report_receipt_save(&mut self, result: Option<Result<(), String>>) {
+        match result {
+            Some(Ok(())) => self.success("Receipt saved."),
+            Some(Err(error)) => self.error(error),
+            None => {}
+        }
+    }
+
     pub(crate) fn create_wallet(&mut self) {
         let directory = self.form_dir.trim().to_owned();
         let name = self.form_name.trim().to_owned();
@@ -697,11 +733,13 @@ impl GuiApp {
             self.error("the password confirmation does not match");
             return;
         }
-        if let Err(error) = state::ensure_private_dir(std::path::Path::new(&directory)) {
+        let spec = backend::wallet_create(&directory, &name, self.form_network, &self.password);
+        if spec.is_ok()
+            && let Err(error) = crate::onboarding_files::prepare_destination(std::path::Path::new(&directory))
+        {
             self.error(error);
             return;
         }
-        let spec = backend::wallet_create(&directory, &name, self.form_network, &self.password);
         self.last_action = "Creating wallet".into();
         self.spawn(
             JobTag::Create {
@@ -724,6 +762,9 @@ impl GuiApp {
                 return;
             }
         };
+        let revision = self.state.wallet.as_ref()
+            .filter(|saved| saved.network == self.form_network && saved.wallet_id == wallet_id)
+            .map_or(revision, |saved| revision.max(saved.revision));
         let wallet = WalletRef {
             directory,
             name,
@@ -780,6 +821,12 @@ impl GuiApp {
             &self.new_password,
             source,
         );
+        if spec.is_ok()
+            && let Err(error) = crate::onboarding_files::prepare_destination(std::path::Path::new(&directory))
+        {
+            self.error(error);
+            return;
+        }
         self.last_action = "Recovering an encrypted backup".into();
         self.spawn(
             JobTag::Recover(WalletRef {
@@ -1675,6 +1722,7 @@ impl GuiApp {
         self.form_wallet_id.clone_from(&wallet.wallet_id);
         self.form_revision = wallet.revision.to_string();
         self.open_mode = OpenMode::Open;
+        self.choosing_wallet = false;
         self.state.wallet = Some(wallet);
     }
 
@@ -2113,7 +2161,7 @@ impl GuiApp {
     // Chrome
     // -----------------------------------------------------------------------
 
-    fn top_bar(&mut self, ctx: &egui::Context) {
+    fn top_bar(&mut self, ctx: &egui::Context, compact: bool) {
         let active = self.form_network;
         let mut selected = active;
         let mut appearance = self.state.appearance;
@@ -2121,19 +2169,24 @@ impl GuiApp {
         egui::TopBottomPanel::top("top-bar")
             .show_separator_line(false)
             .frame(
-                theme::chrome(ctx.theme(), Margin::symmetric(17, 8)).outer_margin(Margin {
-                    left: 14,
-                    right: 14,
-                    top: 12,
+                theme::chrome(ctx.theme(), Margin::symmetric(if compact { 9 } else { 17 }, 8)).outer_margin(Margin {
+                    left: if compact { 8 } else { 14 },
+                    right: if compact { 8 } else { 14 },
+                    top: if compact { 6 } else { 12 },
                     bottom: 5,
                 }),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    theme::wordmark(ui);
-                    ui.add_space(18.0);
+                    if compact {
+                        theme::brand(ui, 28.0);
+                    } else {
+                        theme::wordmark(ui);
+                        ui.add_space(18.0);
+                    }
                     ui.add_enabled_ui(can_switch, |ui| {
                         egui::ComboBox::from_id_salt("active-network")
+                            .width(if compact { 92.0 } else { 100.0 })
                             .selected_text(active.label())
                             .show_ui(ui, |ui| {
                                 for option in Network::ALL {
@@ -2145,7 +2198,22 @@ impl GuiApp {
                                 "Stop the node and finish wallet jobs before switching networks.",
                             );
                     });
-                    if let Some(kind) = self.node_kind {
+                    if compact {
+                        let label = Page::ALL.iter().find(|(page, _)| *page == self.page)
+                            .map_or("Overview", |(_, label)| *label);
+                        egui::ComboBox::from_id_salt("compact-page")
+                            .width(107.0)
+                            .selected_text(label)
+                            .show_ui(ui, |ui| {
+                                for (page, label) in Page::ALL {
+                                    ui.add_enabled_ui(self.unlocked || page == Page::Tools, |ui| {
+                                        ui.selectable_value(&mut self.page, page, label);
+                                    });
+                                }
+                            })
+                            .response
+                            .on_hover_text("Go to a wallet page");
+                    } else if let Some(kind) = self.node_kind {
                         let label = match kind {
                             NodeKind::Run => "Node running",
                             NodeKind::Mine => "Mining active",
@@ -2157,21 +2225,26 @@ impl GuiApp {
                             if ui.add(theme::button_secondary("Lock")).clicked() {
                                 self.lock();
                             }
-                            if let Some(wallet) = &self.state.wallet {
+                            if !compact && let Some(wallet) = &self.state.wallet {
                                 ui.label(theme::caption(&wallet.name));
                             }
-                        } else {
+                        } else if !compact {
                             ui.label(theme::caption("Wallet locked"));
                         }
                         egui::ComboBox::from_id_salt("wallet-appearance")
-                            .selected_text(format!("Appearance · {}", appearance.label()))
+                            .width(if compact { 88.0 } else { 100.0 })
+                            .selected_text(if compact {
+                                appearance.label().to_owned()
+                            } else {
+                                format!("Appearance · {}", appearance.label())
+                            })
                             .show_ui(ui, |ui| {
                                 for option in Appearance::ALL {
                                     ui.selectable_value(&mut appearance, option, option.label());
                                 }
                             })
                             .response
-                            .on_hover_text("System follows your device's appearance.");
+                            .on_hover_text("Appearance. System follows your device's appearance.");
                     });
                 });
             });
@@ -2288,11 +2361,27 @@ impl GuiApp {
             });
     }
 
-    fn status_strip(&mut self, ctx: &egui::Context) {
+    fn status_strip(&mut self, ctx: &egui::Context, compact: bool) {
         egui::TopBottomPanel::bottom("status-strip")
             .show_separator_line(false)
-            .frame(egui::Frame::NONE.inner_margin(Margin::symmetric(24, 8)))
+            .frame(egui::Frame::NONE.inner_margin(Margin::symmetric(
+                if compact { 12 } else { 24 },
+                if compact { 4 } else { 8 },
+            )))
             .show(ctx, |ui| {
+                let live = self.live_chain_now();
+                let chain = Self::status_chain_text(
+                    self.node.is_some(),
+                    live.as_ref(),
+                    self.scanned_height(),
+                );
+                if compact {
+                    theme::compact_controls(ui);
+                    ui.label(theme::caption(&chain));
+                    if self.busy == 0 && self.banner.is_none() {
+                        return;
+                    }
+                }
                 ui.horizontal(|ui| {
                     if self.busy > 0 {
                         ui.spinner();
@@ -2312,39 +2401,41 @@ impl GuiApp {
                             4.0,
                             banner.color(theme::palette(ctx.theme())),
                         );
-                        ui.label(RichText::new(&banner.text).size(14.0).color(
+                        ui.add(egui::Label::new(RichText::new(&banner.text).size(14.0).color(
                             if banner.level == Level::Error {
                                 theme::palette(ctx.theme()).danger
                             } else {
                                 theme::palette(ctx.theme()).muted
                             },
-                        ));
-                    } else {
+                        )).truncate()).on_hover_text(&banner.text);
+                    } else if !compact {
                         ui.label(theme::caption("Ready."));
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if let Some(node) = &self.node {
-                            ui.label(theme::caption(&format!("pid {}", node.pid)));
-                        }
-                        let live = self.live_chain_now();
-                        ui.label(theme::caption(&Self::status_chain_text(
-                            self.node.is_some(),
-                            live.as_ref(),
-                            self.scanned_height(),
-                        )));
-                    });
+                    if !compact {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if let Some(node) = &self.node {
+                                ui.label(theme::caption(&format!("pid {}", node.pid)));
+                            }
+                            ui.label(theme::caption(&chain));
+                        });
+                    }
                 });
             });
     }
 
     fn onboarding(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
-        ui.vertical_centered(|ui| {
-            theme::brand(ui, 56.0);
-            ui.add_space(3.0);
-            ui.label(theme::title("Monario Wallet"));
-            ui.add_space(6.0);
-        });
+        let short = ui.ctx().screen_rect().height() < COMPACT_HEIGHT;
+        if short {
+            theme::compact_controls(ui);
+        } else {
+            ui.add_space(4.0);
+            ui.vertical_centered(|ui| {
+                theme::brand(ui, 56.0);
+                ui.add_space(3.0);
+                ui.label(theme::title("Monario Wallet"));
+                ui.add_space(6.0);
+            });
+        }
         let available = ui.available_width();
         let width = available.min(620.0);
         ui.horizontal(|ui| {
@@ -2355,18 +2446,31 @@ impl GuiApp {
                 |ui| {
                     theme::card(ui)
                         .show(ui, |ui| {
-                            ui.horizontal(|ui| {
+                            if self.choosing_wallet
+                                && ui
+                                    .add_enabled(!self.is_busy(), theme::button_secondary("Back to saved wallet"))
+                                    .clicked()
+                                && let Some(wallet) = self.state.wallet.clone()
+                            {
+                                self.password.zeroize();
+                                self.new_password.zeroize();
+                                self.confirm.zeroize();
+                                self.reveal = false;
+                                self.select_wallet(wallet);
+                                return;
+                            }
+                            ui.horizontal_wrapped(|ui| {
                                 if ui
                                     .selectable_label(self.open_mode == OpenMode::Create, "Create")
                                     .clicked()
                                 {
-                                    self.open_mode = OpenMode::Create;
+                                    self.set_onboarding_mode(OpenMode::Create);
                                 }
                                 if ui
                                     .selectable_label(self.open_mode == OpenMode::Open, "Open")
                                     .clicked()
                                 {
-                                    self.open_mode = OpenMode::Open;
+                                    self.set_onboarding_mode(OpenMode::Open);
                                 }
                                 if ui
                                     .selectable_label(
@@ -2375,18 +2479,12 @@ impl GuiApp {
                                     )
                                     .clicked()
                                 {
-                                    self.open_mode = OpenMode::Recover;
+                                    self.set_onboarding_mode(OpenMode::Recover);
                                 }
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        ui.checkbox(&mut self.reveal, "Show passwords");
-                                    },
-                                );
                             });
                             ui.add_space(6.0);
                             ui.add_enabled_ui(!self.is_busy(), |ui| {
-                                crate::pages::onboard_form(self, ui);
+                                crate::pages::onboard_form(self, ui, short);
                             });
                         });
                 },
@@ -2419,11 +2517,17 @@ impl GuiApp {
     }
 
     fn lock_screen(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(40.0);
+        let short = ui.ctx().screen_rect().height() < COMPACT_HEIGHT;
+        if short {
+            theme::compact_controls(ui);
+        }
+        ui.add_space(if short { 8.0 } else { 40.0 });
         ui.vertical_centered(|ui| {
-            theme::brand(ui, 64.0);
-            ui.add_space(10.0);
-            ui.label(theme::title("Unlock your wallet"));
+            if !short {
+                theme::brand(ui, 64.0);
+                ui.add_space(10.0);
+            }
+            ui.label(if short { theme::subtitle("Unlock your wallet") } else { theme::title("Unlock your wallet") });
             ui.add_space(2.0);
             if let Some(wallet) = &self.state.wallet {
                 ui.label(theme::caption(&format!(
@@ -2468,24 +2572,16 @@ impl GuiApp {
                                 if ui
                                     .add_enabled(
                                         !self.is_busy(),
-                                        theme::button_secondary("Clear saved wallet"),
+                                        theme::button_secondary("Open another wallet…"),
                                     )
                                     .on_hover_text(
-                                        "Clears the saved shortcut and keeps the wallet file.",
+                                        "Choose another wallet file or recover from a backup.",
                                     )
                                     .clicked()
                                 {
-                                    self.state.wallet = None;
-                                    self.unlocked = false;
-                                    self.password.clear();
-                                    self.tools_generation = self.tools_generation.wrapping_add(1);
-                                    self.tools.clear_sensitive();
-                                    self.backup_receipt = None;
-                                    self.page = Page::Overview;
-                                    self.info(
-                                        "Saved shortcut cleared. Your wallet file is intact.",
-                                    );
-                                    self.persist();
+                                    self.set_onboarding_mode(OpenMode::Create);
+                                    self.set_onboarding_mode(OpenMode::Open);
+                                    self.choosing_wallet = true;
                                 }
                             });
                         });
@@ -2525,21 +2621,48 @@ impl eframe::App for GuiApp {
         theme::set_appearance(ctx, self.state.appearance);
         self.poll_node(ctx);
         self.drain_jobs();
+        self.render_ui(ctx);
+    }
+}
+
+impl GuiApp {
+    fn render_ui(&mut self, ctx: &egui::Context) {
         let background = ctx.layer_painter(egui::LayerId::background());
         theme::backdrop(&background, ctx.screen_rect(), ctx.theme());
-        self.top_bar(ctx);
-        self.sidebar(ctx);
-        self.status_strip(ctx);
+        let short = ctx.screen_rect().height() < COMPACT_HEIGHT;
+        let compact = short || ctx.screen_rect().width() < COMPACT_WIDTH;
+        self.top_bar(ctx, compact);
+        if !compact {
+            self.sidebar(ctx);
+        }
+        self.status_strip(ctx, compact);
         egui::CentralPanel::default()
             .frame(
-                egui::Frame::NONE.inner_margin(Margin::symmetric(34, 28)),
+                egui::Frame::NONE.inner_margin(if compact {
+                    Margin::symmetric(12, 10)
+                } else {
+                    Margin::symmetric(34, 28)
+                }),
             )
             .show(ctx, |ui| {
+                if short {
+                    if self.page != Page::Tools && !self.unlocked {
+                        if self.state.wallet.is_none() || self.choosing_wallet {
+                            self.onboarding(ui);
+                        } else {
+                            self.lock_screen(ui);
+                        }
+                        return;
+                    }
+                    theme::compact_controls(ui);
+                    crate::compact::show(ui, self.page, |ui| self.wallet_page(ui));
+                    return;
+                }
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         let tools = self.page == Page::Tools;
-                        if self.state.wallet.is_none() && !tools {
+                        if (self.state.wallet.is_none() || self.choosing_wallet) && !tools {
                             self.onboarding(ui);
                         } else if !self.unlocked && !tools {
                             self.lock_screen(ui);
@@ -2552,20 +2675,24 @@ impl eframe::App for GuiApp {
                                 ui.vertical(|ui| {
                                     ui.set_width(width);
                                     ui.spacing_mut().item_spacing.x = 14.0;
-                                    match self.page {
-                                        Page::Overview => self.overview(ui),
-                                        Page::Send => self.send(ui),
-                                        Page::Receive => self.receive(ui),
-                                        Page::Mining => self.mining(ui),
-                                        Page::Node => self.node(ui),
-                                        Page::Settings => self.settings(ui),
-                                        Page::Tools => self.tools_screen(ui),
-                                    }
+                                    self.wallet_page(ui);
                                 });
                             });
                         }
                     });
             });
+    }
+
+    fn wallet_page(&mut self, ui: &mut egui::Ui) {
+        match self.page {
+            Page::Overview => self.overview(ui),
+            Page::Send => self.send(ui),
+            Page::Receive => self.receive(ui),
+            Page::Mining => self.mining(ui),
+            Page::Node => self.node(ui),
+            Page::Settings => self.settings(ui),
+            Page::Tools => self.tools_screen(ui),
+        }
     }
 }
 
@@ -2576,6 +2703,156 @@ pub(crate) fn atom_text(atoms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_wallet() -> WalletRef {
+        WalletRef {
+            directory: "wallet-fixture".into(),
+            name: "primary".into(),
+            network: Network::Test,
+            wallet_id: "ab".repeat(16),
+            revision: 7,
+        }
+    }
+
+    #[test]
+    fn restart_restores_the_last_wallet_selector_without_unlocking() {
+        let folder = std::env::temp_dir().join(format!(
+            "monario-restart-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let path = folder.join("wallet-gui.json");
+        let mut app = GuiApp::from_state(PersistedState::default());
+        let wallet = test_wallet();
+        app.select_wallet(wallet.clone());
+        app.unlocked = true;
+        app.password.push_str("test password stays in memory");
+        app.state.save_to(&path).unwrap();
+        let bytes = std::fs::read_to_string(&path).unwrap();
+        assert!(!bytes.contains(app.password.as_str()));
+
+        let restored = GuiApp::from_state(PersistedState::load_from(&path));
+        assert_eq!(restored.state.wallet.as_ref(), Some(&wallet));
+        assert_eq!(restored.form_revision, "7");
+        assert_eq!(restored.open_mode, OpenMode::Open);
+        assert!(!restored.unlocked);
+        assert!(restored.password.is_empty());
+        assert!(restored.node.is_none());
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(folder).unwrap();
+    }
+
+    #[test]
+    fn every_wallet_screen_exposes_its_compact_sections() {
+        for (page, expected) in [
+            (Page::Overview, &["Confirmed balance", "Receive", "Local node", "No wallet activity in this session."][..]),
+            (Page::Send, &["Funding pool", "Payment details", "Estimate fee", "No transaction has been signed in this session.", "Check a signed transaction to see its status here."][..]),
+            (Page::Receive, &["NEW RECEIVE ADDRESS", "No address derived in this session yet."][..]),
+            (Page::Mining, &["Mining mode", "Start mining", "Mining status"][..]),
+            (Page::Node, &["NODE IDENTITY", "PINNED PEERS MANIFEST", "CHAIN SOURCE", "REMOTE PAGE BOOTSTRAP", "RUNTIME", "No node status is available.", "No node process is running."][..]),
+            (Page::Settings, &["ACTIVE WALLET", "CHANGE PASSWORD", "ENCRYPTED BACKUP", "WALLET RECEIPTS", "ACCOUNT DISCOVERY", "HELPER PROGRAMS", "WALLET LIMITS"][..]),
+            (Page::Tools, &["Wallet snapshot", "Message", "Sign message", "Verify signature", "Sign or verify a message to see its result.", "Read-only console"][..]),
+        ] {
+            assert_eq!(crate::compact::tabs(page).len(), expected.len());
+            for (index, expected) in expected.iter().enumerate() {
+                let mut app = GuiApp::from_state(PersistedState {
+                    wallet: Some(test_wallet()), ..Default::default()
+                });
+                app.unlocked = true;
+                app.page = page;
+                let ctx = egui::Context::default();
+                theme::apply(&ctx);
+                ctx.data_mut(|data| data.insert_temp(crate::compact::selection_id(page), index));
+                let output = ctx.run(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(540.0, 460.0))),
+                    ..Default::default()
+                }, |ctx| app.render_ui(ctx));
+                assert!(output.shapes.iter().any(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.job.text == *expected => {
+                        shape.clip_rect.contains_rect(text.visual_bounding_rect())
+                    }
+                    _ => false,
+                }), "{page:?} section {index}: {expected}; {:?}",
+                    output.shapes.iter().filter_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) => Some((&text.galley.job.text, text.visual_bounding_rect(), shape.clip_rect)),
+                        _ => None,
+                    }).collect::<Vec<_>>());
+                assert!(app.node.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn compact_wallet_keeps_network_navigation_and_status_in_view() {
+        for (width, height) in [(540.0, 460.0), (790.0, 460.0), (1320.0, 860.0)] {
+            let mut app = GuiApp::from_state(PersistedState::default());
+            let ctx = egui::Context::default();
+            theme::apply(&ctx);
+            let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, height));
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(viewport),
+                    ..Default::default()
+                },
+                |ctx| app.render_ui(ctx),
+            );
+            let visible = |label: &str| {
+                output.shapes.iter().any(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text) if text.galley.job.text == label => {
+                        let bounds = text.visual_bounding_rect();
+                        viewport.contains_rect(bounds) && clipped.clip_rect.contains_rect(bounds)
+                    }
+                    _ => false,
+                })
+            };
+            assert!(visible("Testnet"), "network selector at {width}x{height}");
+            assert!(visible("Overview"), "page navigation at {width}x{height}");
+            assert!(visible("Node not running"), "chain status at {width}x{height}");
+            assert!(visible("Create"), "setup tabs at {width}x{height}");
+            assert!(visible("Browse…"), "file picker at {width}x{height}");
+            assert!(visible("Create encrypted wallet"), "primary action without scrolling at {width}x{height}: {:?}",
+                output.shapes.iter().filter_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text) if text.galley.job.text == "Create encrypted wallet" => Some((text.visual_bounding_rect(), clipped.clip_rect)),
+                    _ => None,
+                }).collect::<Vec<_>>());
+            assert!(app.node.is_none());
+        }
+    }
+
+    #[test]
+    fn compact_open_and_recovery_steps_fit_without_scrolling() {
+        for (mode, step, manual, action) in [
+            (OpenMode::Open, 0, false, "Next: password"),
+            (OpenMode::Open, 0, true, "Use file pickers"),
+            (OpenMode::Open, 1, false, "Unlock wallet"),
+            (OpenMode::Recover, 0, false, "Next: destination"),
+            (OpenMode::Recover, 1, false, "Next: password"),
+            (OpenMode::Recover, 2, false, "Recover wallet"),
+        ] {
+            let mut app = GuiApp::from_state(PersistedState::default());
+            app.set_onboarding_mode(mode);
+            app.setup_step = step;
+            app.setup_manual = manual;
+            let ctx = egui::Context::default();
+            theme::apply(&ctx);
+            let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(540.0, 460.0));
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(viewport),
+                    ..Default::default()
+                },
+                |ctx| app.render_ui(ctx),
+            );
+            assert!(output.shapes.iter().any(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.job.text == action => {
+                    let bounds = text.visual_bounding_rect();
+                    viewport.contains_rect(bounds) && clipped.clip_rect.contains_rect(bounds)
+                }
+                _ => false,
+            }), "{mode:?} step {step}: {action}");
+            assert!(app.node.is_none());
+        }
+    }
 
     fn labels(render: impl FnOnce(&mut GuiApp, &mut egui::Ui)) -> Vec<String> {
         fn collect(shape: &egui::Shape, labels: &mut Vec<String>) {

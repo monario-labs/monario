@@ -6,7 +6,7 @@
 //! methods. Message and proof text is never logged, echoed into history, or
 //! printed by `Debug`.
 use crate::backend;
-use crate::theme;
+use crate::{compact, theme};
 use eframe::egui;
 use std::collections::VecDeque;
 use std::fmt;
@@ -461,17 +461,20 @@ impl ToolsState {
         ui: &mut egui::Ui,
         snapshot: &ConsoleSnapshot,
     ) -> Option<ToolAction> {
-        let reset = std::mem::take(&mut self.reset_undo);
+        let compact_layout = compact::is_active(ui);
+        let reset = compact_layout || std::mem::take(&mut self.reset_undo);
         let unlocked = snapshot.unlocked;
         let mut action = None;
         let mut refresh = false;
         let mut copy: Option<String> = None;
 
-        ui.label(theme::title("Wallet tools"));
-        ui.label(theme::subtitle(
-            "Offline signing and verification, plus a read-only console.",
-        ));
-        ui.add_space(14.0);
+        if !compact_layout {
+            ui.label(theme::title("Wallet tools"));
+            ui.label(theme::subtitle(
+                "Offline signing and verification, plus a read-only console.",
+            ));
+            ui.add_space(14.0);
+        }
         if let Some((tone, text)) = self.status {
             let palette = theme::palette(ui.ctx().theme());
             let color = match tone {
@@ -483,36 +486,35 @@ impl ToolsState {
             ui.add_space(8.0);
         }
 
-        theme::card(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(theme::section("Wallet snapshot"));
-            ui.label(theme::caption(
-                "Read-only copy from the app. Nothing here changes wallet state.",
-            ));
-            ui.add_space(4.0);
-            theme::key_value(ui, "Network", &snapshot.network);
-            theme::key_value(
-                ui,
-                "Wallet",
-                if unlocked { "Unlocked" } else { "Locked" },
-            );
-            match (unlocked, &snapshot.balance) {
-                (false, _) => theme::key_value(ui, "Balance", "Hidden while locked"),
-                (true, None) => theme::key_value(ui, "Balance", "Not loaded"),
-                (true, Some(balance)) => {
-                    theme::key_value(ui, "Transparent", &monar(balance.transparent_atoms));
-                    theme::key_value(ui, "Private", &monar(balance.private_atoms));
-                    theme::key_value(ui, "Validated height", &balance.height.to_string());
+        if compact::includes(ui, "Wallet") {
+            theme::card(ui).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(theme::section("Wallet snapshot"));
+                ui.label(theme::caption(
+                    "Read-only copy from the app. Nothing here changes wallet state.",
+                ));
+                ui.add_space(4.0);
+                theme::key_value(ui, "Network", &snapshot.network);
+                theme::key_value(ui, "Wallet", if unlocked { "Unlocked" } else { "Locked" });
+                match (unlocked, &snapshot.balance) {
+                    (false, _) => theme::key_value(ui, "Balance", "Hidden while locked"),
+                    (true, None) => theme::key_value(ui, "Balance", "Not loaded"),
+                    (true, Some(balance)) => {
+                        theme::key_value(ui, "Transparent", &monar(balance.transparent_atoms));
+                        theme::key_value(ui, "Private", &monar(balance.private_atoms));
+                        theme::key_value(ui, "Validated height", &balance.height.to_string());
+                    }
                 }
-            }
-            ui.add_space(6.0);
-            refresh = ui
-                .add_enabled(!self.busy, theme::button_secondary("Refresh balance"))
-                .clicked();
-        });
-        ui.add_space(12.0);
+                ui.add_space(6.0);
+                refresh = ui
+                    .add_enabled(!self.busy, theme::button_secondary("Refresh balance"))
+                    .clicked();
+            });
+            ui.add_space(12.0);
+        }
 
-        theme::card(ui).show(ui, |ui| {
+        if compact::includes(ui, "Message") {
+            theme::card(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(theme::section("Message"));
             ui.label(theme::caption(
@@ -533,16 +535,37 @@ impl ToolsState {
                 MAX_MESSAGE_BYTES
             )));
         });
-        ui.add_space(12.0);
+            ui.add_space(12.0);
+        }
 
-        ui.columns(2, |columns| {
-            let sign = self.sign_card(&mut columns[0], unlocked, reset);
-            let verify = self.verify_card(&mut columns[1]);
+        if compact_layout {
+            if compact::includes(ui, "Sign") {
+                action = self.sign_card(ui, unlocked, reset);
+            } else if compact::includes(ui, "Verify") {
+                action = self.verify_card(ui);
+            }
+        } else if ui.available_width() >= 720.0 {
+            ui.columns(2, |columns| {
+                let sign = self.sign_card(&mut columns[0], unlocked, reset);
+                let verify = self.verify_card(&mut columns[1]);
+                action = sign.or(verify);
+            });
+        } else {
+            let sign = self.sign_card(ui, unlocked, reset);
+            ui.add_space(12.0);
+            let verify = self.verify_card(ui);
             action = sign.or(verify);
-        });
+        }
         ui.add_space(12.0);
 
-        if let Some(result) = &self.result {
+        if compact_layout && compact::includes(ui, "Result") && self.result.is_none() {
+            ui.label(theme::caption(
+                "Sign or verify a message to see its result.",
+            ));
+        }
+        if compact::includes(ui, "Result")
+            && let Some(result) = &self.result
+        {
             theme::card(ui).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(theme::section("Result"));
@@ -577,7 +600,8 @@ impl ToolsState {
         }
 
         let mut console_action = None;
-        theme::card(ui).show(ui, |ui| {
+        if compact::includes(ui, "Console") {
+            theme::card(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(theme::section("Read-only console"));
             ui.label(theme::caption(
@@ -614,6 +638,7 @@ impl ToolsState {
             ui.add_space(6.0);
             self.history_view(ui);
         });
+        }
         if let Some(console) = console_action {
             action = Some(console);
         }
@@ -628,13 +653,17 @@ impl ToolsState {
             self.set_status(Tone::Success, "Signature copied to the clipboard.");
         }
 
-        if ui.add(theme::button_danger(ui, "Clear tool data")).clicked() {
-            self.clear_sensitive();
-        }
-        ui.label(theme::caption(
+        if compact::includes(ui, "Console") {
+            if ui
+                .add(theme::button_danger(ui, "Clear tool data"))
+                .clicked()
+            {
+                self.clear_sensitive();
+            }
+            ui.label(theme::caption(
             "Clears the message, proof, result, and console output. The app also calls this when the wallet locks or the network changes.",
         ));
-
+        }
         action
     }
 
@@ -728,6 +757,17 @@ impl ToolsState {
             lines.len(),
             self.history.len()
         )));
+        if compact::is_active(ui) {
+            if lines.is_empty() {
+                ui.label(theme::caption("No output."));
+            } else {
+                let range = compact::list(ui, "console-history", lines.len(), 3);
+                for line in &lines[lines.len() - range.end..lines.len() - range.start] {
+                    ui.add(egui::Label::new(theme::mono(line)).wrap());
+                }
+            }
+            return;
+        }
         theme::inset(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
             egui::ScrollArea::vertical()
