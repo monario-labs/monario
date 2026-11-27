@@ -74,13 +74,7 @@ impl<V: TransactionVerifier> Chain<V> {
                 return Err(Error::ResourceLimit);
             }
         }
-        let bits = if height == 1 {
-            self.config.initial_bits
-        } else {
-            self.asert
-                .next_bits(p.height, p.timestamp)
-                .map_err(Error::Pow)?
-        };
+        let bits = self.next_block_bits(p)?;
         let pow_seed = self.seed_for(parent, height)?;
         let (detach, attach) = self.route(self.tip(), parent)?;
         let mut base = Overlay::new(self.ledger());

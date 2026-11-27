@@ -1,7 +1,7 @@
 {
-  "chain_id": "ac018f868eec7f9a280a6d6c91d737f33d84c161364d85cbee2001befac8a82e",
-  "root_commitment": "a94aec5723d7c1f4a7e934a26ef1f3c8f1f0de4622d719a221188859c45e2dc3",
-  "root_id": "c9999dd3980072c5a09a8deff79f53a906464c160dd258ddefae9ef38f584def",
-  "root_timestamp": 1795290540,
+  "chain_id": "4d2b45ffd0dc9350bad7773f3d9e3f85f81e986eac95d885d20b275b8c615109",
+  "root_commitment": "f8bf8414271d6350d4b80b89122d8446e0b0e5ee87b26f0e5ce8a9e7a034a15f",
+  "root_id": "0995e5a8bfbc74c98b944d4ccd019b36b44148b363c561696d805b3c5b69dee2",
+  "root_timestamp": 1795737600,
   "version": 1
 }

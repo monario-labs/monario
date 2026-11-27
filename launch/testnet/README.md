@@ -20,14 +20,15 @@ Compare the SHA-256 result with `root_commitment` in `root.json`. All three comm
 must report this validation profile:
 
 ```text
-fb9a57f8dfb02c16822ded5440d0147864cd3e5a0dadcc568a24ff41cd53b02b
+b98e1a569780fb47a7ac68e284525da49e13267224eec5029b90a9970d989d18
 ```
 
 The bundled check verifies the descriptor compiled into the binary. In the
 release archive, `bootstrap.json` is its public copy and `peers.json` is the
-matching signed envelope, staged for `https://testnet.monario.org/testnet/peers.json`.
-The list expires on 2027-02-01 at 00:00 UTC. Before launch, check that the seed
-still holds the pinned identity and is reachable on its advertised port.
+matching sequence-2 signed envelope for `https://testnet.monario.org/testnet/peers.json`.
+The list expires on 2027-02-01 at 00:00 UTC. Deploy the matching seed identity
+and envelope as part of the profile cutover. The previous endpoint and
+height-zero database belong to a different validation profile.
 
 ## Starting difficulty
 
@@ -36,11 +37,13 @@ block on average, or a 90-second initial interval at an assumed combined
 100 hashes/second. The PoW limit (`0x2000ffff`) permits approximately 256 hashes
 per block at the easiest target. ASERT uses a six-hour half-life.
 
-The anchor timestamp is 2026-11-21 19:49 UTC. From block 2, ASERT accounts for
-elapsed time from this anchor, so a later first block can lower the difficulty
-toward the PoW limit. Replacing the anchor or difficulty changes the profile
-and requires a matching seed identity, a newly signed list and a rebuilt
-release.
+The height-zero root timestamp is 2026-11-27 00:00 UTC. With
+`asert_from_first_block` enabled, each branch derives its ASERT reference time
+from its own validated block 1. Blocks 1 and 2 both use the initial target.
+From block 3, the expected elapsed time at parent height `h` is
+`(h - 1) × 90 seconds` since block 1. This keeps a delayed launch from aging
+the difficulty reference. The root record still establishes the chain identity
+and earliest block timestamp. The profile uses `testnet-v2.sqlite`.
 
 ## Release hygiene
 

@@ -132,6 +132,7 @@ pub fn candidate_config(chain_id: Hash, initial_bits: u32, pow_limit_bits: u32) 
         initial_bits,
         pow_limit_bits,
         half_life_seconds: ASERT_HALF_LIFE_SECONDS,
+        asert_from_first_block: false,
         seed_interval: RANDOMX_SEED_INTERVAL,
         seed_lag: RANDOMX_SEED_LAG,
         coinbase_maturity: COINBASE_MATURITY,

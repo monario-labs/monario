@@ -321,6 +321,26 @@ fn manifest_file(path: &Path, cfg: &Config) -> [u8; 32] {
         .unwrap()
         .validation_profile()
 }
+
+#[test]
+fn wallet_scan_requires_the_first_block_asert_profile_when_enabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut legacy = config();
+    legacy.coinbase_maturity = monario_chain::consensus::COINBASE_MATURITY;
+    legacy.limits.block_bytes = monario_chain::archive::MAX_BLOCK_BYTES;
+    let legacy_profile = manifest_file(dir.path(), &legacy);
+    let mut cfg = legacy;
+    cfg.asert_from_first_block = true;
+    let profile = manifest_file(dir.path(), &cfg);
+    let bytes = fs::read(dir.path().join("manifest.json")).unwrap();
+    let mut doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    doc["asert_from_first_block"] = true.into();
+    let bytes = serde_json::to_vec(&doc).unwrap();
+    assert_ne!(profile, legacy_profile);
+    let parsed = manifest::parse(&bytes, profile).unwrap();
+    assert!(parsed.config.asert_from_first_block);
+    assert!(manifest::parse(&bytes, legacy_profile).is_err());
+}
 fn cli_args(path: &Path, cp: WalletCheckpoint, profile: [u8; 32]) -> Vec<OsString> {
     [
         "balance".to_owned(),
@@ -690,6 +710,7 @@ fn config() -> Config {
         initial_bits: 0x2100ffff,
         pow_limit_bits: 0x2100ffff,
         half_life_seconds: 3600,
+        asert_from_first_block: false,
         seed_interval: 8,
         seed_lag: 2,
         coinbase_maturity: 2,

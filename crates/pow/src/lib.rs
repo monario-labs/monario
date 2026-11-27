@@ -136,6 +136,27 @@ impl Asert {
         }
         let dh = i128::from(parent_height - self.anchor_height) + 1;
         let dt = i128::from(parent_time) - i128::from(self.anchor_parent_time);
+        self.target_at_delta(dt, dh)
+    }
+
+    /// Next target relative to the first block on this exact branch. The first
+    /// block itself defines zero elapsed time and zero elapsed intervals.
+    pub fn next_bits_from_first_block(
+        &self,
+        parent_height: u64,
+        parent_time: u64,
+        first_block_time: u64,
+    ) -> Result<u32, Error> {
+        let intervals = parent_height.checked_sub(1).ok_or(Error::InvalidHeight)?;
+        if parent_height == u64::MAX {
+            return Err(Error::InvalidHeight);
+        }
+        let dt = i128::from(parent_time) - i128::from(first_block_time);
+        self.target_at_delta(dt, i128::from(intervals))
+            .map(|target| target.to_compact())
+    }
+
+    fn target_at_delta(&self, dt: i128, dh: i128) -> Result<Target, Error> {
         // u64 times/heights and a 90-second interval fit comfortably in i128,
         // including the multiplication by 65536. Signed division truncates to zero.
         let exponent = ((dt - i128::from(BLOCK_SECONDS) * dh) * 65536) / i128::from(self.half_life);

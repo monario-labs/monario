@@ -314,6 +314,7 @@ fn public_block_submission_uses_real_v6_and_randomx() {
         initial_bits: 0x2100ffff,
         pow_limit_bits: 0x2100ffff,
         half_life_seconds: 3600,
+        asert_from_first_block: false,
         seed_interval: 8,
         seed_lag: 2,
         coinbase_maturity: 2,

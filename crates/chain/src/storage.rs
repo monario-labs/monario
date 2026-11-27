@@ -1117,6 +1117,9 @@ pub(crate) fn identity(c: &Config, r: Root) -> Hash {
     ] {
         b.extend(n.to_le_bytes());
     }
+    if c.asert_from_first_block {
+        b.extend(b"Monario/asert-first-block/v1\0");
+    }
     hash_domain(b"Monario/storage-profile/v6\0", &[&b])
 }
 fn encoded_limit(c: &Config) -> Result<usize, StorageError> {

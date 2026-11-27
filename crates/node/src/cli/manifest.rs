@@ -14,6 +14,8 @@ struct Document {
     initial_bits: u32,
     pow_limit_bits: u32,
     half_life_seconds: u64,
+    #[serde(default)]
+    asert_from_first_block: bool,
     seed_interval: u64,
     seed_lag: u64,
     max_future_seconds: u32,
@@ -120,6 +122,7 @@ fn build(bytes: &[u8]) -> Result<([u8; 32], Manifest), Error> {
         initial_bits: doc.initial_bits,
         pow_limit_bits: doc.pow_limit_bits,
         half_life_seconds: doc.half_life_seconds,
+        asert_from_first_block: doc.asert_from_first_block,
         seed_interval: doc.seed_interval,
         seed_lag: doc.seed_lag,
         coinbase_maturity: consensus::COINBASE_MATURITY,

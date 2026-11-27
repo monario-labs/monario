@@ -104,6 +104,7 @@ pub struct Config {
     pub initial_bits: u32,
     pub pow_limit_bits: u32,
     pub half_life_seconds: u64,
+    pub asert_from_first_block: bool,
     pub seed_interval: u64,
     pub seed_lag: u64,
     pub coinbase_maturity: u64,
@@ -153,6 +154,9 @@ struct Node {
     parent: Option<Hash>,
     height: u64,
     timestamp: u64,
+    // Derived from the validated parent. Keeps the exact branch anchor after
+    // the optional in-memory history floor evicts the height-one header.
+    first_block_time: u64,
     commitment: Hash,
     /// Selected-branch shielded state root after this block. Retained even after
     /// undo data is evicted so historical block metadata stays correct.
@@ -288,6 +292,7 @@ impl<V: TransactionVerifier> Chain<V> {
                 parent: None,
                 height: 0,
                 timestamp: root.timestamp,
+                first_block_time: 0,
                 commitment: root.commitment,
                 shielded_root: ledger::ShieldedTree::default().root(),
                 work: BigUint::ZERO,
@@ -314,6 +319,22 @@ impl<V: TransactionVerifier> Chain<V> {
     }
     pub fn validation_profile(&self) -> Hash {
         storage::identity(&self.config, self.root)
+    }
+
+    fn next_block_bits(&self, parent: &Node) -> Result<u32, Error> {
+        if parent.height == 0 {
+            return Ok(self.config.initial_bits);
+        }
+        if self.config.asert_from_first_block {
+            self.asert.next_bits_from_first_block(
+                parent.height,
+                parent.timestamp,
+                parent.first_block_time,
+            )
+        } else {
+            self.asert.next_bits(parent.height, parent.timestamp)
+        }
+        .map_err(Error::Pow)
     }
     pub fn tip(&self) -> Hash {
         self.tip
@@ -808,15 +829,16 @@ impl<V: TransactionVerifier> Chain<V> {
         if block.header.timestamp > now.saturating_add(u64::from(self.config.max_future_seconds)) {
             return Err(Error::FutureTime);
         }
-        let target = if height == 1 {
-            if block.header.bits != self.config.initial_bits {
-                return Err(Error::Pow(monario_pow::Error::InvalidParameters));
-            }
-            Target::from_compact(block.header.bits).map_err(Error::Pow)?
-        } else {
+        let target = if height > 1 && !self.config.asert_from_first_block {
             self.asert
                 .validate_bits(block.header.bits, parent.height, parent.timestamp)
                 .map_err(Error::Pow)?
+        } else {
+            let expected = self.next_block_bits(parent)?;
+            if block.header.bits != expected {
+                return Err(Error::Pow(monario_pow::Error::InvalidParameters));
+            }
+            Target::from_compact(expected).map_err(Error::Pow)?
         };
         let seed = self.seed_for(block.header.parent, height)?;
         pow.check(
@@ -826,6 +848,11 @@ impl<V: TransactionVerifier> Chain<V> {
         )?;
         let work = &parent.work + target.work();
         let parent_commitment = parent.commitment;
+        let first_block_time = if height == 1 {
+            block.header.timestamp
+        } else {
+            parent.first_block_time
+        };
         let became_best = work > self.nodes[&self.tip].work;
         if became_best {
             self.check_finality(id, block.header.parent, height)?;
@@ -873,6 +900,7 @@ impl<V: TransactionVerifier> Chain<V> {
             parent: Some(block.header.parent),
             height,
             timestamp: block.header.timestamp,
+            first_block_time,
             commitment: block.header.commitment,
             shielded_root,
             work,

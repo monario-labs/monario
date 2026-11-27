@@ -99,6 +99,7 @@ pub(super) fn config() -> Config {
         initial_bits: 0x1d00ffff,
         pow_limit_bits: 0x207fffff,
         half_life_seconds: 3600,
+        asert_from_first_block: false,
         seed_interval: 8,
         seed_lag: 2,
         coinbase_maturity: 2,
@@ -201,11 +202,7 @@ pub(super) fn spend(chain: &Chain<FixtureVerifier>, id: u64, inputs: &[u64], out
 pub(super) fn block(chain: &Chain<FixtureVerifier>, parent: Hash, time: u32, txs: &[u64]) -> Block {
     let p = &chain.nodes[&parent];
     let height = p.height + 1;
-    let bits = if height == 1 {
-        chain.config.initial_bits
-    } else {
-        chain.asert.next_bits(p.height, p.timestamp).unwrap()
-    };
+    let bits = chain.next_block_bits(p).unwrap();
     let ids: Vec<Hash> = txs.iter().map(|id| tx_id(*id)).collect();
     let auth: Vec<_> = txs
         .iter()
@@ -798,6 +795,43 @@ fn branch_difficulty_comes_from_its_parent_not_the_active_tip() {
         Err(Error::Pow(_))
     ));
     add(&mut chain, b, 4645, &[3]);
+}
+
+#[test]
+fn first_block_asert_ignores_launch_delay_and_uses_each_forks_anchor() {
+    let mut cfg = config();
+    cfg.asert_from_first_block = true;
+    let mut chain = Chain::new(cfg.clone(), root(), FixtureVerifier::default()).unwrap();
+    let legacy = Chain::new(config(), root(), FixtureVerifier::default()).unwrap();
+    assert_ne!(chain.validation_profile(), legacy.validation_profile());
+    cb(&chain, 1, 1, 1);
+    let a = add(&mut chain, root().id, 10_000, &[1]).id;
+    cb(&chain, 2, 1, 1);
+    let b = add(&mut chain, root().id, 20_000, &[2]).id;
+    cb(&chain, 3, 2, 1);
+    cb(&chain, 4, 2, 1);
+    assert_eq!(block(&chain, a, 10_090, &[3]).header.bits, cfg.initial_bits);
+    assert_eq!(block(&chain, b, 20_180, &[4]).header.bits, cfg.initial_bits);
+    let a2 = add(&mut chain, a, 10_090, &[3]).id;
+    let b2 = add(&mut chain, b, 20_180, &[4]).id;
+    cb(&chain, 5, 3, 1);
+    let a_bits = block(&chain, a2, 10_180, &[5]).header.bits;
+    let b_bits = block(&chain, b2, 20_270, &[5]).header.bits;
+    assert_eq!(a_bits, cfg.initial_bits);
+    assert!(Target::from_compact(b_bits).unwrap() > Target::from_compact(a_bits).unwrap());
+    let mut wrong = block(&chain, b2, 20_270, &[5]);
+    wrong.header.bits = a_bits;
+    assert!(matches!(
+        chain.submit_checked(wrong, 20_270, &mut FixturePow::default()),
+        Err(Error::Pow(monario_pow::Error::InvalidParameters))
+    ));
+    let template = chain
+        .build_template(b2, 20_270, 20_270, vec![], |_| Ok(5_u64.to_le_bytes().to_vec()))
+        .unwrap();
+    assert_eq!(template.block.header.bits, b_bits);
+    let reorg = add(&mut chain, b2, 20_270, &[5]);
+    assert!(reorg.became_best);
+    assert_eq!(reorg.disconnected, vec![a2, a]);
 }
 
 #[test]

@@ -26,6 +26,7 @@ fn config() -> Config {
         initial_bits: 0x2100ffff,
         pow_limit_bits: 0x2100ffff,
         half_life_seconds: 3600,
+        asert_from_first_block: false,
         seed_interval: 8,
         seed_lag: 2,
         coinbase_maturity: 2,

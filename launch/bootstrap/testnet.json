@@ -1,8 +1,8 @@
 {
-  "profile": "fb9a57f8dfb02c16822ded5440d0147864cd3e5a0dadcc568a24ff41cd53b02b",
-  "signing_key": "2b4eeba28ca1fa89bd993b7ce10b3f92b583b65d711638ea8e8d6ac5f74bff2d",
   "fallback": {
-    "payload": "{\"version\":1,\"network\":\"testnet\",\"profile\":\"fb9a57f8dfb02c16822ded5440d0147864cd3e5a0dadcc568a24ff41cd53b02b\",\"sequence\":1,\"expires\":1801440000,\"peers\":[{\"address\":\"152.53.163.188:19445\",\"public_key\":\"a1048c9ff2238404a088d3f30f6e563bfdb8054f25f96408e8d0c90fabb70827\"}]}",
-    "signature": "95a0a87ab7aa68b8362be6c040b2c8d90b06e297c05c9237fef3f2c7a468807305cfa1ca2418563cc2dda333400fae09dd78ca2afa6f251d72ad6cd11f56650d"
-  }
+    "payload": "{\"version\":1,\"network\":\"testnet\",\"profile\":\"b98e1a569780fb47a7ac68e284525da49e13267224eec5029b90a9970d989d18\",\"sequence\":2,\"expires\":1801440000,\"peers\":[{\"address\":\"152.53.163.188:19445\",\"public_key\":\"a814d306b5cf402cfe5b1accda3b3e17775cc9c412423c1f2c34e0fccba0a457\"}]}",
+    "signature": "f655c843030eddfbd30a81ccb19d0bde558886432cd8c1a2230ec07b46bd137a6122b00771ffff1fb82990b9ac141b91ffa549b127eaf6c48bd279d42fce7702"
+  },
+  "profile": "b98e1a569780fb47a7ac68e284525da49e13267224eec5029b90a9970d989d18",
+  "signing_key": "2b4eeba28ca1fa89bd993b7ce10b3f92b583b65d711638ea8e8d6ac5f74bff2d"
 }

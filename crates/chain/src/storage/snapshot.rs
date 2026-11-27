@@ -178,6 +178,7 @@ fn create_inner<V: TransactionVerifier>(
                     parent,
                     height,
                     timestamp,
+                    first_block_time: 0,
                     commitment,
                     shielded_root,
                     work,
@@ -440,7 +441,14 @@ pub(super) fn restore<V: TransactionVerifier>(
         if height != 0 {
             let parent = c.nodes[&id].parent.ok_or(StorageError::Corrupt)?;
             let skip = c.ancestor(parent, height & (height - 1))?;
-            c.nodes.get_mut(&id).ok_or(StorageError::Corrupt)?.skip = Some(skip);
+            let first_block_time = if height == 1 {
+                c.nodes[&id].timestamp
+            } else {
+                c.nodes[&parent].first_block_time
+            };
+            let node = c.nodes.get_mut(&id).ok_or(StorageError::Corrupt)?;
+            node.skip = Some(skip);
+            node.first_block_time = first_block_time;
         }
     }
     // Every header is restored; re-apply the producer's retention bound so memory
@@ -868,6 +876,7 @@ impl Reader<'_> {
             parent,
             height,
             timestamp,
+            first_block_time: 0,
             commitment,
             shielded_root,
             work,
@@ -1540,6 +1549,37 @@ mod tests {
         assert_eq!((inclusion.height, inclusion.depth), (1, 512));
         assert!(crate::tests::CONFIRMATION_STEPS.with(|n| n.get()) <= 64);
     }
+    #[test]
+    fn first_block_asert_is_rebuilt_before_checkpoint_history_is_evicted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("first-block-asert.sqlite");
+        let mut cfg = config();
+        cfg.asert_from_first_block = true;
+        let mut pow = CountPow::default();
+        let mut d = DurableChain::open_recovered(
+            &path, cfg.clone(), root(), verifier(), 30_000, &mut pow, None,
+        ).unwrap();
+        let mut parent = root().id;
+        for height in 1..=8 {
+            cb(&d.chain, 100 + height, height, 0);
+            let candidate = block(&d.chain, parent, 10_000 + 90 * (height as u32 - 1), &[100 + height]);
+            assert_eq!(candidate.header.bits, cfg.initial_bits);
+            parent = d.submit_checked(candidate, 30_000, &mut pow).unwrap().id;
+        }
+        d.chain.advance_history_floor(3).unwrap();
+        let token = d.create_state_checkpoint(limits()).unwrap();
+        drop(d);
+        pow.0 = 0;
+        let recovered = DurableChain::open_recovered(
+            &path, cfg.clone(), root(), verifier(), 30_000, &mut pow, Some((token, limits())),
+        ).unwrap();
+        assert_eq!(pow.0, 0);
+        assert_eq!(recovered.chain.history_floor(), 3);
+        let tip = &recovered.chain.nodes[&parent];
+        assert_eq!(tip.first_block_time, 10_000);
+        assert_eq!(recovered.chain.next_block_bits(tip).unwrap(), cfg.initial_bits);
+    }
+
     #[test]
     fn bounded_history_floor_round_trips_through_checkpoint() {
         let dir = tempfile::tempdir().unwrap();
