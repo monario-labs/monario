@@ -1402,6 +1402,7 @@ impl GuiApp {
                     address: self.state.mining_address.trim().to_owned(),
                     workers: self.state.mining_workers,
                     network: self.state.mining_network,
+                    secure_jit: self.state.mining_secure_jit,
                     pool_mode: self.state.mining_pool_mode,
                     pool,
                 };
@@ -3057,7 +3058,7 @@ mod tests {
             app.mining(ui);
             assert!(app.node.is_none());
         });
-        for text in ["Pool host or IP", "Port", "Pool credential", "Use maximum"] {
+        for text in ["Pool host or IP", "Port", "Pool credential", "Use maximum", "Secure JIT"] {
             assert!(custom.iter().any(|label| label == text));
         }
         assert!(

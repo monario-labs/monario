@@ -366,6 +366,7 @@ pub struct MiningConfig<'a> {
     pub address: String,
     pub workers: u8,
     pub network: Network,
+    pub secure_jit: bool,
     pub pool_mode: PoolMode,
     pub pool: Option<PoolSpec<'a>>,
 }
@@ -1972,6 +1973,9 @@ pub fn node_mine(
         "--miner-network".into(),
         mining.network.as_str().into(),
     ]);
+    if mining.secure_jit {
+        args.push("--miner-secure-jit".into());
+    }
     if let Some(pool) = &mining.pool {
         args.extend([
             "--pool-mode".into(),

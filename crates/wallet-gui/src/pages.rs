@@ -1176,14 +1176,21 @@ impl GuiApp {
                         || (!self.pool_credential.is_empty()
                             && !self.state.mining_pool_address.trim().is_empty()
                             && !self.state.mining_pool_port.trim().is_empty());
-                    ui.checkbox(
-                        &mut self.state.mining_network_enabled,
-                        "Connect to blockchain peers",
-                    )
-                    .on_hover_text(if self.state.mining_pool_mode == PoolMode::Custom {
-                        "Custom pool always connects to your pool. This option also connects your node to blockchain peers."
-                    } else {
-                        "Leave unchecked to run the node locally without a peer listener."
+                    ui.horizontal_wrapped(|ui| {
+                        ui.add_enabled(
+                            !running && !busy,
+                            egui::Checkbox::new(&mut self.state.mining_secure_jit, "Secure JIT"),
+                        )
+                        .on_hover_text("Use the faster RandomX backend for mining. Changes apply the next time mining starts.");
+                        ui.checkbox(
+                            &mut self.state.mining_network_enabled,
+                            "Connect to blockchain peers",
+                        )
+                        .on_hover_text(if self.state.mining_pool_mode == PoolMode::Custom {
+                            "Custom pool always connects to your pool. This option also connects your node to blockchain peers."
+                        } else {
+                            "Leave unchecked to run the node locally without a peer listener."
+                        });
                     });
                     if !is_compact {
                         ui.add_space(8.0);

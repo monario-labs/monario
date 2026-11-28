@@ -17,7 +17,9 @@ transparent payout address matching the active network. Custom pool mining takes
 the pool host or IP, port, and a credential from the operator that ties your
 authenticated identity to that pool; register your payout address with the
 operator. No pool preset, credentials, or working pool are bundled. Mining starts
-only after an explicit action.
+only after an explicit action. Enable **Secure JIT** in the Mining tab to use the
+accelerated RandomX backend. It starts disabled and applies to the next mining
+session. Block verification keeps its existing execution mode.
 
 ## Build and verify a native package
 

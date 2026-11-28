@@ -101,6 +101,8 @@ jobs:
           Invoke-Native @('cargo', 'test', '--locked', '--offline', '-p', 'monario-wallet-cli', '--lib', '--', 'message::tests', 'backup_directory_tests', 'wallet_scan_requires_the_first_block_asert_profile_when_enabled')
           Invoke-Native @('cargo', 'test', '--locked', '--offline', '-p', 'monario-chain', '--lib', 'first_block_asert')
           Invoke-Native @('cargo', 'test', '--locked', '--offline', '-p', 'monario-node', '--test', 'launch')
+          Invoke-Native @('cargo', 'test', '--locked', '--offline', '-p', 'monario-node', '--lib', 'mining_jit_requires_explicit_opt_in_on_mine')
+          Invoke-Native @('cargo', 'test', '--locked', '--offline', '-p', 'monario-randomx', '--test', 'vectors')
 
           Invoke-Native @($py, 'tools/verify_vendor.py')
           $env:MONARIO_PRIVATE_SCAN_FILE = $privateTerms

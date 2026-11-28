@@ -142,6 +142,7 @@ fn passwords_never_reach_arguments() {
                 address: SOLO_REGTEST.into(),
                 workers: 2,
                 network: Network::Regtest,
+                secure_jit: false,
                 pool_mode: PoolMode::Solo,
                 pool: None,
             },
@@ -247,6 +248,7 @@ fn node_activation_is_always_explicit() {
         address: SOLO_TEST.into(),
         workers: 3,
         network: Network::Test,
+        secure_jit: false,
         pool_mode: PoolMode::Solo,
         pool: None,
     };
@@ -262,6 +264,29 @@ fn node_activation_is_always_explicit() {
     )
     .unwrap();
     assert!(spec.args.iter().any(|arg| arg == "--enable-mining"));
+    assert!(!spec.args.iter().any(|arg| arg == "--miner-secure-jit"));
+    let accelerated = node_mine(
+        &node(),
+        "chain.json",
+        "",
+        "gui-status.json",
+        "gui.stop",
+        &MiningConfig {
+            secure_jit: true,
+            ..mining.clone()
+        },
+        false,
+        &pw("aaaaaaaaaaaa"),
+    )
+    .unwrap();
+    assert_eq!(
+        accelerated
+            .args
+            .iter()
+            .filter(|arg| *arg == "--miner-secure-jit")
+            .count(),
+        1
+    );
     assert!(!spec.args.iter().any(|arg| arg == "--enable-network"));
     assert!(
         spec.args
@@ -332,6 +357,7 @@ fn custom_pool_passes_credentials_on_stdin_only() {
         address: String::new(),
         workers: 12,
         network: Network::Test,
+        secure_jit: true,
         pool_mode: PoolMode::Custom,
         pool: Some(PoolSpec {
             address: pool_endpoint("2001:db8::1", "19444").unwrap(),
@@ -350,6 +376,7 @@ fn custom_pool_passes_credentials_on_stdin_only() {
         &password,
     )
     .unwrap();
+    assert!(spec.args.iter().any(|arg| arg == "--miner-secure-jit"));
     assert!(spec.args.windows(2).any(|w| w == ["--pool-mode", "custom"]));
     assert!(
         spec.args
@@ -681,6 +708,7 @@ fn solo_payout_address_needs_matching_network_and_transparent_receiver() {
         address: "rmont1fixture".into(),
         workers: 1,
         network: Network::Regtest,
+        secure_jit: false,
         pool_mode: PoolMode::Custom,
         pool: Some(PoolSpec {
             address: pool_endpoint("pool.example", "19444").unwrap(),
