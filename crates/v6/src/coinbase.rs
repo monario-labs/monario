@@ -5,6 +5,28 @@ use monario_monetary::rewards::miner_reward;
 use zcash_protocol::{consensus::BranchId, value::Zatoshis};
 pub use zcash_transparent::address::TransparentAddress as CoinbaseReceiver;
 
+/// Public transparent outputs from a canonical coinbase serialization.
+/// Callers must separately authenticate its block and chain inclusion.
+pub fn transparent_outputs(
+    raw: &[u8],
+    limit: usize,
+) -> Result<(usize, Vec<(u64, Option<CoinbaseReceiver>)>), Error> {
+    let tx = crate::decode(raw)?;
+    let bundle = tx.transparent_bundle().ok_or(Error::Invalid)?;
+    if !bundle.is_coinbase() {
+        return Err(Error::Invalid);
+    }
+    Ok((
+        bundle.vout.len(),
+        bundle
+            .vout
+            .iter()
+            .take(limit)
+            .map(|output| (u64::from(output.value()), output.recipient_address()))
+            .collect(),
+    ))
+}
+
 /// Encode the full coinbase value to the miner's transparent receiver.
 /// `miner` is a raw typed receiver: callers must validate the address's network
 /// before extracting it. `extra_data` is public coinbase data, never a secret.

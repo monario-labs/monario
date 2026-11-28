@@ -131,6 +131,43 @@ fn read_only_methods_return_bounded_public_data() {
 }
 
 #[test]
+fn block_transactions_returns_authenticated_coinbase_and_public_recipient() {
+    use crate::tests::{REAL, clock, coinbase_with_script, root};
+    use monario_address::{Address, Network, Receiver, TransparentReceiver};
+    let _serial = REAL.lock().unwrap();
+    let (_dir, mut node) = crate::tests::node();
+    let recipient = Address::new(
+        Network::Test,
+        Receiver::Transparent(TransparentReceiver::PublicKeyHash([7; 20])),
+    );
+    let chain = node.source().chain().unwrap();
+    let candidate = chain.build_template(root().id, 1105, 1_000_000, vec![], |plan| {
+        Ok(coinbase_with_script(plan, 100, recipient.script_pubkey().unwrap()))
+    }).unwrap();
+    let block = monario_chain::wire::encode(&candidate.block, chain.limits(), &crate::V6Verifier)
+        .unwrap();
+    let block_id = node.import_block(&block, clock(0)).unwrap().id;
+    let raw = &node.source().stored_block(block_id).unwrap().transactions[0];
+    let expected = hex(&monario_v6::transaction_id(raw).unwrap());
+    let call_for = |id: [u8; 32], network: &str| {
+        call(&node, json!({
+            "id": 1, "method": "block-transactions", "params": {"id": hex(&id), "network": network}
+        }))
+    };
+    let result = call_for(block_id, "test");
+    assert_eq!(result["ok"], true);
+    let result = &result["result"];
+    assert_eq!(result["ids"], json!([expected]));
+    assert_eq!(result["transaction_count"], 1);
+    assert_eq!(result["coinbase_output_count"], 1);
+    let output = &result["coinbase_outputs"][0];
+    assert_eq!(output["atoms"], "100");
+    assert_eq!(output["address"], recipient.encode());
+    assert_eq!(call_for(root().id, "test")["error"], "not-found");
+    assert_eq!(call_for(block_id, "invalid")["error"], "invalid-params");
+}
+
+#[test]
 fn unknown_malformed_and_oversized_requests_fail_generically() {
     let (_dir, node) = crate::tests::node();
     let unknown = call(

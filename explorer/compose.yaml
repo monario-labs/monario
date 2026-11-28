@@ -1,0 +1,41 @@
+services:
+  replica:
+    image: python:3.12-slim-trixie
+    restart: unless-stopped
+    user: "${MONARIO_EXPLORER_UID:?set replica UID}:${MONARIO_EXPLORER_GID:?set replica GID}"
+    command: ["python", "-B", "/opt/explorer/run-replica.py"]
+    init: true
+    stop_grace_period: 40s
+    volumes:
+      - "${MONARIO_EXPLORER_ROOT:?set explorer root}/private:/replica:rw"
+      - "${MONARIO_EXPLORER_ROOT:?set explorer root}/publish.py:/opt/explorer/publish.py:ro"
+      - "${MONARIO_EXPLORER_ROOT:?set explorer root}/run-replica.py:/opt/explorer/run-replica.py:ro"
+      - "${MONARIO_EXPLORER_ROOT:?set explorer root}/snapshots:/snapshots:rw"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 64
+  explorer:
+    image: nginx/nginx-unprivileged:stable-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:18755:8080"
+    volumes:
+      - "${MONARIO_EXPLORER_ROOT:?set explorer root}/public:/usr/share/nginx/html:ro"
+      - "${MONARIO_EXPLORER_ROOT:?set explorer root}/nginx.conf:/etc/nginx/conf.d/default.conf:ro"
+      - "${MONARIO_EXPLORER_ROOT:?set explorer root}/snapshots:/srv/snapshot:ro"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 32
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/snapshot.json"]
+      interval: 30s
+      timeout: 3s
+      retries: 3

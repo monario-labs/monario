@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Inspect the validated tip and recent blocks on the Monario testnet.">
+  <title>Testnet Explorer · Monario</title>
+  <link rel="icon" href="monario-mark.png">
+  <link rel="stylesheet" href="style.css">
+  <script src="explorer.js" defer></script>
+</head>
+<body>
+  <header><div class="shell header">
+    <a class="brand" href="https://monario.org/"><img src="monario-mark.png" alt="" width="37" height="37">Monario</a>
+    <p class="network">Testnet</p>
+  </div></header>
+  <main class="shell">
+    <section class="intro">
+      <div><h1>Block explorer</h1><p>Follow the Monario testnet chain.</p></div>
+      <div class="height"><span>Chain height</span><strong id="height">—</strong></div>
+    </section>
+    <section aria-labelledby="recent">
+      <div class="section-heading">
+        <div><h2 id="recent">Recent blocks</h2><p id="status" role="status">Loading chain data…</p></div>
+        <form id="search" role="search">
+          <label for="query">Filter recent blocks</label>
+          <div class="search-field"><input id="query" type="search" maxlength="64" placeholder="Height, block hash or transaction ID" autocomplete="off" spellcheck="false"></div>
+        </form>
+      </div>
+      <ul id="blocks" aria-label="Blocks"></ul>
+      <p id="empty" hidden></p>
+    </section>
+  </main>
+  <footer class="shell">Monario <span>·</span> Testnet explorer</footer>
+</body>
+</html>

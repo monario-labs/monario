@@ -306,6 +306,7 @@ fn handle_request(node: &Node, line: &[u8]) -> Vec<u8> {
     let result = match method {
         "status" => status(node),
         "block" => block(node, params),
+        "block-transactions" => block_transactions(node, params),
         "transaction" => transaction(node, params),
         "mempool" => Ok(json!({"count": node.mempool().len()})),
         "peers" => Ok(json!({"count": node.peer_count()})),
@@ -350,6 +351,44 @@ fn block(node: &Node, params: Option<&Value>) -> Result<Value, &'static str> {
         "height": info.height.to_string(),
         "parent": info.parent.map(|parent| hex(&parent)),
         "commitment": hex(&info.commitment),
+    }))
+}
+
+fn block_transactions(node: &Node, params: Option<&Value>) -> Result<Value, &'static str> {
+    use monario_address::{Address, Network, Receiver};
+    const MAX_IDS: usize = 24;
+    const MAX_OUTPUTS: usize = 8;
+    let id = params_id(params)?;
+    let namespace = match params.and_then(|p| p.get("network")).and_then(Value::as_str) {
+        Some("main") => Network::Main,
+        Some("test") => Network::Test,
+        Some("regtest") => Network::Regtest,
+        _ => return Err("invalid-params"),
+    };
+    let source = node.source();
+    let chain = source.chain().map_err(|_| "unavailable")?;
+    let info = source.block_info(&id).map_err(|_| "unavailable")?.ok_or("not-found")?;
+    if info.height == 0 {
+        return Err("not-found");
+    }
+    let raw = source.authenticated_block_bytes(id).map_err(|_| "unavailable")?;
+    let block = monario_chain::wire::decode(&raw, chain.limits(), &crate::V6Verifier)
+        .map_err(|_| "unavailable")?;
+    let ids = block.transactions.iter().take(MAX_IDS)
+        .map(|bytes| monario_v6::transaction_id(bytes).map(|id| hex(&id)))
+        .collect::<Result<Vec<_>, _>>().map_err(|_| "unavailable")?;
+    let coinbase = block.transactions.first().ok_or("unavailable")?;
+    let (output_count, outputs) = monario_v6::coinbase::transparent_outputs(coinbase, MAX_OUTPUTS)
+        .map_err(|_| "unavailable")?;
+    let outputs = outputs.into_iter().map(|(atoms, receiver)| {
+        let address = receiver.map(|receiver| Address::new(namespace, Receiver::Transparent(receiver)).encode());
+        json!({"atoms": atoms.to_string(), "address": address})
+    }).collect::<Vec<_>>();
+    Ok(json!({
+        "transaction_count": block.transactions.len(),
+        "ids": ids,
+        "coinbase_output_count": output_count,
+        "coinbase_outputs": outputs,
     }))
 }
 

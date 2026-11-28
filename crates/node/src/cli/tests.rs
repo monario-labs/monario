@@ -196,6 +196,39 @@ fn arguments_fail_closed_without_secret_echo_or_implicit_network() {
 }
 
 #[test]
+fn mining_jit_requires_explicit_opt_in_on_mine() {
+    let (dir, checkpoint) = fixture();
+    let mut mine = args("check", dir.path(), checkpoint);
+    mine[0] = "mine".into();
+    mine.extend(
+        [
+            "--enable-mining",
+            "--miner-address",
+            "rmont1qyqqqqgzqvzq2ps8pqys5zcvp58q7yq3zgfs7grwe7",
+            "--miner-workers",
+            "1",
+            "--miner-network",
+            "regtest",
+        ]
+        .map(str::to_owned),
+    );
+    assert!(matches!(
+        parse(mine.clone()).mining.unwrap().mode,
+        monario_randomx::Mode::Interpreter
+    ));
+    mine.push("--miner-secure-jit".into());
+    assert!(matches!(
+        parse(mine.clone()).mining.unwrap().mode,
+        monario_randomx::Mode::SecureJit
+    ));
+    mine.push("--miner-secure-jit".into());
+    assert!(Command::parse(mine.into_iter().map(OsString::from)).is_err());
+    let mut node = args("run", dir.path(), checkpoint);
+    node.push("--miner-secure-jit".into());
+    assert!(Command::parse(node.into_iter().map(OsString::from)).is_err());
+}
+
+#[test]
 fn mine_rejects_invalid_solo_payout_address_before_activation() {
     const REGTEST: &str = "rmont1qyqqqqgzqvzq2ps8pqys5zcvp58q7yq3zgfs7grwe7";
     const TEST: &str = "testmont1qyqqqqgzqvzq2ps8pqys5zcvp58q7yq3zgfsxp6xum";
